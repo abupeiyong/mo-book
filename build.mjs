@@ -17,7 +17,7 @@ const OUT = join(HERE, "build", "mo-book.epub");
 
 const BOOK = {
   title: "从零搭建你自己的 Code Agent",
-  subtitle: "Mo 开发实录：一个最小 AI 编程助手的两步诞生记",
+  subtitle: "Mo 开发实录：一个最小 AI 编程助手的三步诞生记",
   author: "peiyong",
   language: "zh-CN",
   date: "2026-08-31",
