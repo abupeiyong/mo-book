@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>附录 A：完整代码 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>附录 A：完整代码</h1>
+<p>以下是里程碑 2 完成时的全部源码（约 700 行），作为教学基线；里程碑 3 新增的 <code>session.ts</code>、<code>ask_user</code>、重试逻辑等以节选形式出现在第 5 章。完整、最新的仓库在 <code>github.com/abupeiyong/mo</code>。</p>
+<h2>A.1 <code>src/model.ts</code></h2>
+<pre><code>// Thin client for an OpenAI-compatible "chat completions" API, using native fetch.
+// This is the only place that knows about HTTP or the wire format.
+
+export type ModelConfig = {
+  apiKey: string;
+  baseUrl: string; // e.g. https://api.example.com/v1
+  model: string;
+};
+
+/** A tool as advertised to the model (OpenAI "function" tool format). */
+export type ToolDefinition = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record&lt;string, unknown&gt;; // JSON Schema for the arguments
+  };
+};
+
+/** A tool invocation requested by the model. Arguments arrive as a JSON string. */
+export type ToolCall = {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+};
+
+export type AssistantMessage = {
+  role: "assistant";
+  content: string | null;
+  tool_calls?: ToolCall[];
+};
+
+export type Message =
+  | { role: "system"; content: string }
+  | { role: "user"; content: string }
+  | AssistantMessage
+  | { role: "tool"; tool_call_id: string; content: string };
+
+type ChatCompletionResponse = {
+  choices: { message: AssistantMessage }[];
+};
+
+/** Read MO_API_KEY, MO_BASE_URL and MO_MODEL from the environment. */
+export function configFromEnv(): ModelConfig {
+  return {
+    apiKey: requireEnv("MO_API_KEY"),
+    baseUrl: requireEnv("MO_BASE_URL").replace(/\/+$/, ""),
+    model: requireEnv("MO_MODEL"),
+  };
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable ${name}`);
+  }
+  return value;
+}
+
+/** Send the conversation to the model and return its next message. */
+export async function chat(
+  config: ModelConfig,
+  messages: Message[],
+  tools: ToolDefinition[],
+): Promise&lt;AssistantMessage&gt; {
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify({ model: config.model, messages, tools }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Model API error ${response.status}: ${await response.text()}`);
+  }
+
+  const data = (await response.json()) as ChatCompletionResponse;
+  const message = data.choices[0]?.message;
+  if (!message) {
+    throw new Error("Model API returned no choices");
+  }
+
+  // Keep only the fields we understand so the history stays clean when sent back.
+  return { role: "assistant", content: message.content ?? null, tool_calls: message.tool_calls };
+}</code></pre>
+<h2>A.2 <code>src/agent.ts</code></h2>
+<pre><code>// The agent loop: prompt -&gt; model -&gt; (tool calls -&gt; results -&gt; model)* -&gt; final text.
+
+import { chat, type Message, type ModelConfig } from "./model.js";
+import { executeTool, toolDefinitions } from "./tools/index.js";
+
+const SYSTEM_PROMPT = `You are Mo, a minimal AI coding assistant running in the user's terminal.
+You can search, read, edit and write files and run shell commands in the current working directory using the provided tools.
+Use tools to look at real files and outputs instead of guessing. When the task is done, reply with a concise final answer.
+When changing code:
+- Use search_files and read_file to look at the real code before editing.
+- Prefer edit_file when changing existing files.
+- Use write_file only to create new files or for a deliberate full-file replacement.
+- After making changes, run the project's existing typecheck, test and build commands.`;
+
+/** Safety cap so a confused model cannot loop (and bill) forever. */
+const MAX_TURNS = 50;
+
+export async function runAgent(config: ModelConfig, prompt: string): Promise&lt;string&gt; {
+  const messages: Message[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: prompt },
+  ];
+
+  for (let turn = 0; turn &lt; MAX_TURNS; turn++) {
+    const reply = await chat(config, messages, toolDefinitions);
+    messages.push(reply);
+
+    // No tool calls -&gt; this is the final answer.
+    if (!reply.tool_calls || reply.tool_calls.length === 0) {
+      if (reply.content === null) {
+        throw new Error("Model returned neither tool calls nor a final text response");
+      }
+      return reply.content;
+    }
+
+    // Execute every requested tool and append each result as a "tool" message,
+    // then go around the loop so the model can see the results.
+    for (const call of reply.tool_calls) {
+      console.error(`[tool] ${call.function.name} ${call.function.arguments}`);
+      const result = await executeTool(call.function.name, call.function.arguments);
+      messages.push({ role: "tool", tool_call_id: call.id, content: result });
+    }
+  }
+
+  throw new Error(`Agent stopped after ${MAX_TURNS} turns without a final answer`);
+}</code></pre>
+<h2>A.3 <code>src/index.ts</code></h2>
+<pre><code>#!/usr/bin/env node
+// Mo CLI entry point. Run directly: `mo "&lt;prompt&gt;"` (global install),
+// or from source: `npm run dev -- "&lt;prompt&gt;"`.
+
+import { readFileSync, existsSync } from "node:fs";
+import { runAgent } from "./agent.js";
+import { configFromEnv } from "./model.js";
+
+// When run as a globally installed binary there is no --env-file flag, so
+// load a .env from the current directory if one exists. Never overrides
+// variables that are already set in the environment.
+const envPath = ".env";
+if (existsSync(envPath)) {
+  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+    const eq = trimmed.indexOf("=");
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+
+const args = process.argv.slice(2);
+
+if (args.includes('--version')) {
+  console.log(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
+  process.exit(0);
+}
+
+const prompt = args.join(" ").trim();
+if (!prompt) {
+  console.error('Usage: mo "&lt;prompt&gt;"');
+  process.exit(1);
+}
+
+try {
+  const answer = await runAgent(configFromEnv(), prompt);
+  console.log(answer);
+} catch (error) {
+  console.error(`mo: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}</code></pre>
+<h2>A.4 <code>src/tools/index.ts</code></h2>
+<pre><code>// Tool registry and dispatcher. The agent loop only ever talks to this file.
+
+import type { ToolDefinition } from "../model.js";
+import { readFileTool } from "./read-file.js";
+import { runShellTool } from "./run-shell.js";
+import { writeFileTool } from "./write-file.js";
+import { editFileTool } from "./edit-file.js";
+import { searchFilesTool } from "./search-files.js";
+
+/** A tool = what the model sees (definition) + what runs locally (execute). */
+export type Tool = {
+  definition: ToolDefinition;
+  execute: (args: Record&lt;string, unknown&gt;) =&gt; Promise&lt;string&gt;;
+};
+
+const tools: Tool[] = [readFileTool, writeFileTool, runShellTool, editFileTool, searchFilesTool];
+
+/** Definitions in the shape the chat completions API expects. */
+export const toolDefinitions: ToolDefinition[] = tools.map((tool) =&gt; tool.definition);
+
+/**
+ * Run a tool by name with its JSON-encoded arguments.
+ * Failures are returned as text (not thrown) so the model can read and react to them.
+ */
+export async function executeTool(name: string, rawArgs: string): Promise&lt;string&gt; {
+  const tool = tools.find((t) =&gt; t.definition.function.name === name);
+  if (!tool) {
+    return `Error: unknown tool "${name}"`;
+  }
+
+  try {
+    const args = (rawArgs.trim() === "" ? {} : JSON.parse(rawArgs)) as Record&lt;string, unknown&gt;;
+    return await tool.execute(args);
+  } catch (error) {
+    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}</code></pre>
+<h2>A.5 <code>src/tools/path.ts</code></h2>
+<pre><code>// Workspace path boundary. Every file tool resolves model-supplied paths here
+// so containment logic lives in one place. This is not a sandbox: run_shell can
+// still touch anything the user can.
+
+import { lstat, realpath } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+
+/** Workspace root = the working directory when Mo started. */
+export const workspaceRoot = realpathSync(process.cwd());
+
+function isInsideWorkspace(absolutePath: string): boolean {
+  const rel = relative(workspaceRoot, absolutePath);
+  return rel === "" || (!rel.startsWith("..") &amp;&amp; !isAbsolute(rel));
+}
+
+function outsideWorkspaceError(path: string): Error {
+  return new Error(`path "${path}" is outside the workspace; paths must stay inside the working directory Mo was started in`);
+}
+
+/**
+ * Resolve a path that must already exist (read_file, edit_file, search_files).
+ * Symlinks are followed via realpath before the containment check, so a link
+ * inside the workspace cannot point outside it.
+ */
+export async function resolveExistingPath(path: string): Promise&lt;string&gt; {
+  const resolved = resolve(workspaceRoot, path);
+  if (!isInsideWorkspace(resolved)) {
+    throw outsideWorkspaceError(path);
+  }
+
+  let real: string;
+  try {
+    real = await realpath(resolved);
+  } catch {
+    throw new Error(`file not found: "${path}"`);
+  }
+  if (!isInsideWorkspace(real)) {
+    throw outsideWorkspaceError(path);
+  }
+  return real;
+}
+
+/**
+ * Resolve a path that may not exist yet (write_file). The nearest existing
+ * ancestor (or the target itself, if it exists) is realpath'd before the
+ * containment check, so a symlinked directory cannot escape the workspace.
+ */
+export async function resolveWritePath(path: string): Promise&lt;string&gt; {
+  const resolved = resolve(workspaceRoot, path);
+  if (!isInsideWorkspace(resolved)) {
+    throw outsideWorkspaceError(path);
+  }
+
+  let existing = resolved;
+  while (true) {
+    try {
+      await lstat(existing);
+    } catch {
+      // Does not exist yet; try the parent next.
+      const parent = dirname(existing);
+      if (parent === existing) {
+        throw outsideWorkspaceError(path);
+      }
+      existing = parent;
+      continue;
+    }
+
+    let real: string;
+    try {
+      real = await realpath(existing);
+    } catch {
+      // An entry exists but cannot be resolved (for example, a dangling
+      // symlink). Treat it as unsafe instead of falling back to its parent:
+      // writeFile would follow that symlink and could create a file outside.
+      throw outsideWorkspaceError(path);
+    }
+    if (!isInsideWorkspace(real)) {
+      throw outsideWorkspaceError(path);
+    }
+    return resolved;
+  }
+}</code></pre>
+<h2>A.6 <code>src/tools/read-file.ts</code></h2>
+<pre><code>import { readFile } from "node:fs/promises";
+import type { Tool } from "./index.js";
+import { resolveExistingPath } from "./path.js";
+
+export const readFileTool: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a UTF-8 text file and return its full contents.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to the workspace root. Must stay inside the workspace.",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+
+  async execute(args) {
+    const path = args.path;
+    if (typeof path !== "string") {
+      throw new Error("read_file: 'path' must be a string");
+    }
+    return readFile(await resolveExistingPath(path), "utf8");
+  },
+};</code></pre>
+<h2>A.7 <code>src/tools/write-file.ts</code></h2>
+<pre><code>import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import type { Tool } from "./index.js";
+import { resolveWritePath } from "./path.js";
+
+export const writeFileTool: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "write_file",
+      description:
+        "Write text to a file, replacing any existing content. Creates the file and parent directories if needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to the workspace root. Must stay inside the workspace.",
+          },
+          content: {
+            type: "string",
+            description: "The full text content to write.",
+          },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
+
+  async execute(args) {
+    const { path, content } = args;
+    if (typeof path !== "string" || typeof content !== "string") {
+      throw new Error("write_file: 'path' and 'content' must be strings");
+    }
+    const resolved = await resolveWritePath(path);
+    await mkdir(dirname(resolved), { recursive: true });
+    await writeFile(resolved, content, "utf8");
+    return `Wrote ${content.length} characters to ${path}`;
+  },
+};</code></pre>
+<h2>A.8 <code>src/tools/run-shell.ts</code></h2>
+<pre><code>import { exec } from "node:child_process";
+import type { Tool } from "./index.js";
+
+const TIMEOUT_MS = 60_000;
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+
+export const runShellTool: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "run_shell",
+      description:
+        "Run a shell command in the current working directory and return its exit code, stdout and stderr. " +
+        `Commands are killed after ${TIMEOUT_MS / 1000} seconds.`,
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "The shell command to run, e.g. `ls -la` or `npm test`.",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
+
+  execute(args) {
+    const command = args.command;
+    if (typeof command !== "string") {
+      throw new Error("run_shell: 'command' must be a string");
+    }
+
+    return new Promise((resolve) =&gt; {
+      exec(command, { timeout: TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) =&gt; {
+        // A non-zero exit is reported to the model as text, not thrown as an error.
+        const exitCode = error ? (error.code ?? "unknown") : 0;
+        const timedOut = error?.killed ? ` (killed after ${TIMEOUT_MS / 1000}s timeout)` : "";
+        resolve(`exit code: ${exitCode}${timedOut}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      });
+    });
+  },
+};</code></pre>
+<h2>A.9 <code>src/tools/edit-file.ts</code></h2>
+<pre><code>import { readFile, writeFile } from "node:fs/promises";
+import type { Tool } from "./index.js";
+import { resolveExistingPath } from "./path.js";
+
+export const editFileTool: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description:
+        "Replace one exact occurrence of old_text with new_text in an existing file inside the workspace. " +
+        "Fails without touching the file if old_text is not found or appears more than once.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Path to an existing file, relative to the workspace root.",
+          },
+          old_text: {
+            type: "string",
+            description: "Exact existing text to replace; must appear exactly once in the file.",
+          },
+          new_text: {
+            type: "string",
+            description: "The replacement text.",
+          },
+        },
+        required: ["path", "old_text", "new_text"],
+      },
+    },
+  },
+
+  async execute(args) {
+    const { path, old_text: oldText, new_text: newText } = args;
+    if (typeof path !== "string" || typeof oldText !== "string" || typeof newText !== "string") {
+      throw new Error("edit_file: 'path', 'old_text' and 'new_text' must be strings");
+    }
+    if (oldText === "") {
+      throw new Error("edit_file: 'old_text' must not be empty");
+    }
+
+    const resolved = await resolveExistingPath(path);
+    const content = await readFile(resolved, "utf8");
+
+    const first = content.indexOf(oldText);
+    if (first === -1) {
+      throw new Error(`edit_file: old_text was not found in ${path}; read the file and pass the exact existing text`);
+    }
+    if (content.indexOf(oldText, first + 1) !== -1) {
+      throw new Error(
+        `edit_file: old_text appears more than once in ${path}; include more surrounding context so it matches exactly once`,
+      );
+    }
+
+    const updated = content.slice(0, first) + newText + content.slice(first + oldText.length);
+    await writeFile(resolved, updated, "utf8");
+    return `Edited ${path}: replaced ${oldText.length} characters with ${newText.length} characters`;
+  },
+};</code></pre>
+<h2>A.10 <code>src/tools/search-files.ts</code></h2>
+<pre><code>import { readFile, readdir, stat } from "node:fs/promises";
+import { join, relative } from "node:path";
+import type { Tool } from "./index.js";
+import { resolveExistingPath, workspaceRoot } from "./path.js";
+
+const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "dist"]);
+const MAX_MATCHES = 200;
+
+export const searchFilesTool: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "search_files",
+      description:
+        "Search UTF-8 text files recursively for a literal string (no regex). " +
+        `Returns matches as path:line:content, at most ${MAX_MATCHES}. Skips .git, node_modules and dist.`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Literal text to search for. Not a regex.",
+          },
+          path: {
+            type: "string",
+            description:
+              "Directory (or file) to search, relative to the workspace root. Defaults to the workspace root.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+
+  async execute(args) {
+    const { query, path } = args;
+    if (typeof query !== "string" || query === "") {
+      throw new Error("search_files: 'query' must be a non-empty string");
+    }
+    if (path !== undefined &amp;&amp; typeof path !== "string") {
+      throw new Error("search_files: 'path' must be a string");
+    }
+
+    const root = await resolveExistingPath(path ?? ".");
+    const matches: string[] = [];
+    let truncated = false;
+
+    const searchFile = async (filePath: string): Promise&lt;void&gt; =&gt; {
+      let content: string;
+      try {
+        content = await readFile(filePath, "utf8");
+      } catch {
+        return; // unreadable file; skip
+      }
+      if (content.includes("\u0000")) {
+        return; // binary file; skip
+      }
+      const lines = content.split("\n");
+      for (let i = 0; i &lt; lines.length; i++) {
+        const line = lines[i].replace(/\r$/, "");
+        if (!line.includes(query)) {
+          continue;
+        }
+        if (matches.length &gt;= MAX_MATCHES) {
+          truncated = true;
+          return;
+        }
+        matches.push(`${relative(workspaceRoot, filePath)}:${i + 1}:${line}`);
+      }
+    };
+
+    const walk = async (dir: string): Promise&lt;void&gt; =&gt; {
+      const entries = await readdir(dir, { withFileTypes: true });
+      entries.sort((a, b) =&gt; a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (truncated) {
+          return;
+        }
+        const entryPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!SKIPPED_DIRECTORIES.has(entry.name)) {
+            await walk(entryPath);
+          }
+        } else if (entry.isFile()) {
+          await searchFile(entryPath); // symlinks are neither, so they are skipped
+        }
+      }
+    };
+
+    if ((await stat(root)).isDirectory()) {
+      await walk(root);
+    } else {
+      await searchFile(root);
+    }
+
+    if (matches.length === 0) {
+      return `No matches found for "${query}"`;
+    }
+    const output = matches.join("\n");
+    return truncated ? `${output}\n(truncated: showing the first ${MAX_MATCHES} matches)` : output;
+  },
+};</code></pre>
+<h2>A.11 <code>test/tools.test.ts</code>（测试要点）</h2>
+<p>测试使用 Node 内置 <code>node:test</code>，通过 <code>tsx</code> 执行。要点：</p>
+<ul><li>直接调用 <code>executeTool</code>（工具名 + JSON 字符串参数），同时覆盖了注册表和</li></ul>
+<p>  "失败返回文本"契约</p>
+<ul><li>fixture 放在工作区内的 <code>tmp/tools-test-fixtures/</code>，测试结束在 <code>after()</code> 中清理</li><li>一个 mkdtemp 目录放在工作区外，用于构造符号链接逃逸场景</li><li>对"零匹配 / 多匹配不写文件"的断言同时检查内容<strong>和 mtime</strong> 未变</li></ul>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-06.html">← 第 5 章 Milestone 3：让 agent 开口问（交互式会话）</a><span></span><a href="ch-08.html">附录 B：命令与验收清单 →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

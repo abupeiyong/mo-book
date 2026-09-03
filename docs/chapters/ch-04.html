@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>第 3 章 Milestone 2：让 agent 可控地修改自己的代码 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>第 3 章 Milestone 2：让 agent 可控地修改自己的代码</h1>
+<h2>3.1 为什么"改自己的代码"这么难</h2>
+<p>Milestone 1 的 review 发现三个 P1 问题：</p>
+<ol><li><strong><code>write_file</code> 不适合修改现有代码</strong>。它会无条件覆盖整个文件。</li></ol>
+<p>   模型只要漏掉一段原文件内容，文件就被静默破坏。修改应该是"精确替换"，    而不是"整文件重写"。</p>
+<ol><li><strong>文件工具没有工作区边界</strong>。schema 允许绝对路径，模型可以读写工作目录之外的文件。</li><li><strong>缺少定位能力</strong>。模型要么猜路径整文件读取，要么靠 <code>run_shell</code> 调外部搜索命令。</li></ol>
+<p>   它需要一个原生的 <code>search_files</code>。</p>
+<ol><li><strong>修改工具没有自动测试</strong>。精确编辑和路径边界都是不可逆写入，</li></ol>
+<p>   不能只靠 typecheck。</p>
+<p>Milestone 2 的解决方案：新增 <code>edit_file</code>（唯一匹配才替换）、<code>search_files</code>（字面搜索）、 <code>path.ts</code>（统一路径边界），并给它们加上 <code>node:test</code> 测试。</p>
+<h2>3.2 路径边界：让工具留在工作区内</h2>
+<p><code>src/tools/path.ts</code> 是这次最重要的安全代码。它的任务是： <strong>所有文件工具传入的路径，都必须解析到工作区内</strong>。</p>
+<pre><code>import { lstat, realpath } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+
+/** 工作区根 = Mo 启动时所在的目录 */
+export const workspaceRoot = realpathSync(process.cwd());
+
+function isInsideWorkspace(absolutePath: string): boolean {
+  const rel = relative(workspaceRoot, absolutePath);
+  return rel === "" || (!rel.startsWith("..") &amp;&amp; !isAbsolute(rel));
+}</code></pre>
+<p>为什么不能只做字符串前缀检查？因为<strong>符号链接</strong>。一个工作区内的符号链接 可以指向工作区外的文件。字符串 <code>path.resolve()</code> 算出来路径在工作区内， 但 <code>fs</code> 实际读写的是链接指向的地方。所以规则是：</p>
+<ul><li><strong>已存在的目标</strong>：先 <code>realpath</code>（跟随所有符号链接）再验证归属。</li><li><strong>新文件</strong>（可能不存在）：验证"最近的已存在祖先目录"的 realpath 归属，</li></ul>
+<p>  防止通过符号链接目录逃逸。</p>
+<ul><li><strong>悬空的符号链接</strong>：存在但无法 <code>realpath</code>（目标不存在）——直接拒绝，</li></ul>
+<p>  因为 <code>writeFile</code> 会跟随它把文件创建到链接指向的地方。</p>
+<pre><code>export async function resolveWritePath(path: string): Promise&lt;string&gt; {
+  const resolved = resolve(workspaceRoot, path);
+  if (!isInsideWorkspace(resolved)) {
+    throw outsideWorkspaceError(path);
+  }
+
+  let existing = resolved;
+  while (true) {
+    try {
+      await lstat(existing);
+    } catch {
+      // 不存在 → 继续往父目录找最近的已存在祖先
+      const parent = dirname(existing);
+      if (parent === existing) throw outsideWorkspaceError(path);
+      existing = parent;
+      continue;
+    }
+    try {
+      const real = await realpath(existing);
+      if (!isInsideWorkspace(real)) throw outsideWorkspaceError(path);
+      return resolved;
+    } catch {
+      // 存在但无法解析（如悬空符号链接）：视为不安全，writeFile 会跟随它写出去
+      throw outsideWorkspaceError(path);
+    }
+  }
+}</code></pre>
+<p><strong>重要</strong>：这份代码的注释里写着 "This is not a sandbox"。路径边界只约束文件工具； <code>run_shell</code> 仍然可以访问任何当前用户有权限的地方。安全边界不能靠局部工具约束 建立——那需要完整的权限系统，不属于本里程碑。诚实地说清楚边界， 比假装安全更重要。</p>
+<h2>3.3 <code>edit_file</code>：唯一匹配才替换</h2>
+<p><code>edit_file(path, old_text, new_text)</code> 的语义：</p>
+<ul><li><code>old_text</code> 必须是非空字符串</li><li>必须在文件中<strong>恰好出现一次</strong>才允许替换</li><li>出现零次：拒绝，提示"读文件后传入精确文本"</li><li>出现多次：拒绝，提示"包含更多上下文以唯一匹配"</li><li>零次或多次时，文件内容和 mtime 都不得改变</li></ul>
+<p>实现上有一个值得注意的细节——<strong>不要用 <code>String.replace</code></strong>：</p>
+<pre><code>const first = content.indexOf(oldText);
+if (first === -1) {
+  throw new Error(`edit_file: old_text was not found in ${path}; read the file and pass the exact existing text`);
+}
+if (content.indexOf(oldText, first + 1) !== -1) {
+  throw new Error(`edit_file: old_text appears more than once in ${path}; include more surrounding context so it matches exactly once`);
+}
+
+// 用 slice 拼接而不是 replace：
+// replace 会把 new_text 里的 $1、$$ 等当模式替换符处理，导致内容被悄悄改写
+const updated = content.slice(0, first) + newText + content.slice(first + oldText.length);
+await writeFile(resolved, updated, "utf8");</code></pre>
+<p>如果目标文本包含 <code>$</code>，<code>String.replace</code> 会把它解释成替换模式—— 这是又一个"测试全绿但结果是坏的"的坑。slice 拼接没有这个问题。</p>
+<h2>3.4 <code>search_files</code>：让模型先找再看</h2>
+<p><code>search_files(query, path?)</code>：</p>
+<ul><li><code>query</code> 必须是非空字符串，<strong>只支持字面匹配，不支持正则</strong></li><li><code>path</code> 可选，默认工作区根，且必须在工作区内</li><li>递归搜索 UTF-8 文本文件</li><li>默认跳过 <code>.git</code>、<code>node_modules</code>、<code>dist</code></li><li>输出格式 <code>path:line:content</code></li><li>最多 200 条匹配，超出时明确标注截断</li><li>无匹配时返回明确文本而不是异常</li></ul>
+<p>实现用纯 TypeScript 递归遍历（不依赖 <code>rg</code>/<code>grep</code>，也不新增依赖）：</p>
+<pre><code>const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "dist"]);
+const MAX_MATCHES = 200;</code></pre>
+<p>遍历时按文件名排序保证输出确定性；检测 NUL 字节跳过二进制文件； 符号链接既不是目录也不是文件（<code>Dirent.isDirectory()</code> 和 <code>isFile()</code> 都为 false）， 天然被跳过。</p>
+<p><strong>为什么第一版不做正则？</strong> 字面匹配的语义简单、无性能陷阱、无 ReDoS 风险。 能力边界是刻意的：先做对，再做全。</p>
+<h2>3.5 系统提示：约束行为而不是堆功能</h2>
+<p>Milestone 2 对系统提示只增加四条行为约束：</p>
+<pre><code>When changing code:
+- Use search_files and read_file to look at the real code before editing.
+- Prefer edit_file when changing existing files.
+- Use write_file only to create new files or for a deliberate full-file replacement.
+- After making changes, run the project's existing typecheck, test and build commands.</code></pre>
+<p>注意：<strong>没有</strong>加 planning mode、权限交互、记忆或 context compaction。 行为约束应该放在提示词里，机制复杂度应该尽量少加。</p>
+<h2>3.6 测试：用 Node 内置 test runner 给不可逆操作上保险</h2>
+<p>项目选择 <code>node:test</code>（Node 内置测试框架）+ <code>tsx</code> 执行，零新增依赖：</p>
+<pre><code>"test": "tsx --test test/tools.test.ts"</code></pre>
+<p>测试覆盖验收清单的每一项：</p>
+<ul><li>搜索返回匹配和正确行号</li><li>搜索跳过 <code>node_modules</code>、<code>.git</code>、<code>dist</code></li><li>唯一匹配被成功替换</li><li>零匹配不写文件（断言内容和 mtime 都不变）</li><li>多匹配不写文件（同上）</li><li><code>../</code> 路径被拒绝</li><li>指向工作区外的符号链接被拒绝</li><li>（审查者补充）通过悬空符号链接向外部写文件被拒绝</li></ul>
+<p>测试用临时 fixture 目录（<code>tmp/tools-test-fixtures/</code>）在测试内创建和清理， 绝不触碰真实的 <code>src/</code> 文件。</p>
+<h2>3.7 验收实录：Mo 给自己加 <code>--version</code></h2>
+<p>验收标准是让 Mo 完成一次真实的自我修改。在干净的工作树里运行：</p>
+<pre><code>npm run dev -- "Inspect package.json and the relevant source files.
+Add a --version CLI option that prints the package version.
+Use search_files and read_file before editing, use edit_file for existing files,
+then run npm run typecheck, npm test, and npm run build. Keep the change minimal."</code></pre>
+<p><strong>第一轮</strong>，Mo 的操作序列堪称教科书：</p>
+<pre><code>[tool] search_files {"query":"version","path":"package.json"}
+[tool] read_file {"path":"package.json"}
+[tool] search_files {"query":"process.argv","path":"src"}
+[tool] edit_file {"path":"src/index.ts", ...}      ← 插入了 --version 分支
+[tool] run_shell {"command": "npm run typecheck"}
+[tool] run_shell {"command": "npm test"}
+[tool] run_shell {"command": "npm run build"}</code></pre>
+<p>全部通过。但验收命令 <code>npm run dev -- --version</code> 崩溃了： <code>ERR_AMBIGUOUS_MODULE_SYNTAX</code>。</p>
+<p><strong>为什么 typecheck/test/build 全绿，运行时却炸了？</strong></p>
+<p>Mo 插入的代码是 <code>console.log(require('../package.json').version)</code>， 但项目是 ESM（<code>"type": "module"</code>），运行时根本没有 <code>require</code>。 三个检查为什么都没拦住？</p>
+<ul><li><code>typecheck</code> 没拦住：<code>@types/node</code> 声明了全局 <code>require</code>，类型上"合法"</li><li><code>npm test</code> 没拦住：测试只测工具函数，不加载 CLI 入口 <code>src/index.ts</code></li><li><code>npm run build</code> 没拦住：<code>tsc</code> 编译通过</li></ul>
+<p><strong>经典盲区：测试覆盖不到入口。</strong> 模型能通过"项目自带的检查"，不代表功能正确—— 检查本身就是模型写完的代码的一部分，而检查恰好覆盖不到 CLI 入口。</p>
+<p><strong>第二轮</strong>，把崩溃信息喂回给 Mo：</p>
+<pre><code>npm run dev -- "You introduced a bug in src/index.ts: the --version branch calls
+require('../package.json'), but this project is ESM, so 'npm run dev -- --version'
+crashes with ERR_AMBIGUOUS_MODULE_SYNTAX. Fix it without require — use node:fs
+readFileSync and JSON.parse. Use read_file first, use edit_file, then run
+typecheck/test/build. Keep the change minimal."</code></pre>
+<p>Mo 这次 <code>read_file → edit_file</code> 精准替换了一行：</p>
+<pre><code>console.log(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);</code></pre>
+<p>然后 <code>npm run dev -- --version</code> 正确输出 <code>0.1.0</code>，diff 只有 8 行新增、1 行删除。</p>
+<p><strong>这个故事说明三件事：</strong></p>
+<ol><li>自修改循环真的能工作：定位 → 读取 → 精确编辑 → 验证，全程真实工具调用</li><li>失败会以文本形式回到模型，模型能基于错误信息自我修正——这正是</li></ol>
+<p>   "失败返回文本而不是抛异常"设计的意义</p>
+<ol><li>工具链的验证要覆盖到真实入口。<code>npm test</code> 绿 ≠ 程序对。</li></ol>
+<h2>3.8 审查者发现：悬空符号链接逃逸</h2>
+<p>实现完成后，独立的审查 agent（Codex）尝试攻破路径边界，发现了一个真实漏洞：</p>
+<ol><li>在工作区内创建一个<strong>悬空的符号链接</strong>，指向工作区外一个不存在的文件</li><li>对这条链接调用 <code>write_file</code></li><li>原实现：<code>lstat</code> 成功（链接存在）→ 目标"不存在"→ 走新文件分支验证父目录</li></ol>
+<p>   → 父目录在工作区内 → 通过 → <code>writeFile</code> 跟随链接把文件写到了工作区外！</p>
+<p>修复：<code>realpath</code> 失败（存在但无法解析）即拒绝。补了回归测试。</p>
+<p><strong>这个案例的教学意义</strong>：路径安全检查的难点在于"文件系统是动态的"—— 同一个路径在不同时刻可以是文件、链接、或不存在。每一层都要问： "这一步之后，fs 到底会碰哪里？"</p>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-03.html">← 第 2 章 Milestone 1：跑通最小 agent loop</a><span></span><a href="ch-05.html">第 4 章 经验与教训 →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

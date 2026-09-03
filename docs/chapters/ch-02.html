@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>第 1 章 全景：一个 code agent 的最小组成 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>第 1 章 全景：一个 code agent 的最小组成</h1>
+<p>在写任何代码之前，先想清楚：一个 AI 编程助手，最小需要哪些零件？</p>
+<h2>1.1 核心循环</h2>
+<p>所有 agent 框架的本质都是同一个循环：</p>
+<pre><code>用户 prompt
+    ↓
+模型
+    ↓
+有工具调用？
+ ┌── 是 → 执行工具 → 结果追加回消息 → 再问模型
+ │
+ └── 否 → 打印最终答案 → 退出</code></pre>
+<p>看起来简单，但每一步都有值得琢磨的细节：</p>
+<ul><li><strong>模型</strong>：怎么调用？用什么协议？怎么把工具定义发给它？</li><li><strong>工具</strong>：模型发来"调用请求"，本地怎么执行？参数怎么校验？失败怎么办？</li><li><strong>循环</strong>：工具结果怎么回填给模型？消息历史怎么维护？什么时候终止？怎么防止死循环？</li><li><strong>边界</strong>：用户输入怎么进来？最终答案怎么出去？API 地址、密钥、模型名怎么配置？</li></ul>
+<h2>1.2 四个零件</h2>
+<p>我们把 Mo 拆成四个文件，每个文件一个职责：</p>
+<table><thead><tr><th>文件</th><th>职责</th></tr></thead><tbody><tr><td><code>src/model.ts</code></td><td>唯一知道 HTTP 和协议的地方：用原生 fetch 调 <code>/chat/completions</code></td></tr><tr><td><code>src/tools/</code></td><td>工具注册表 + 每个工具的实现：模型看到什么、本地执行什么</td></tr><tr><td><code>src/agent.ts</code></td><td>核心循环：维护消息历史，决定何时继续、何时终止</td></tr><tr><td><code>src/index.ts</code></td><td>CLI 边界：读环境变量和命令行参数，打印最终答案</td></tr></tbody></table>
+<h2>1.3 关键决策</h2>
+<p>Mo 一开始就定下的约束，每一个都是为了"保持小、可读、无框架"：</p>
+<ol><li><strong>OpenAI 兼容协议</strong>。几乎所有模型厂商（OpenAI、DeepSeek、GLM、本地 Ollama……）</li></ol>
+<p>   都提供 OpenAI 兼容的 <code>/chat/completions</code> 接口。只认这一个协议，端点可配置，    以后想换模型只需要改环境变量。</p>
+<ol><li><strong>原生 <code>fetch</code></strong>。Node 18+ 内置 fetch，不需要 axios。</li><li><strong>零运行时依赖</strong>。<code>package.json</code> 的 devDependencies 只有</li></ol>
+<p>   <code>typescript</code>、<code>tsx</code>、<code>@types/node</code>。</p>
+<ol><li><strong>TypeScript + strict</strong>。类型就是文档，尤其对于"模型返回的 JSON 是字符串"这种</li></ol>
+<p>   最容易出错的地方。</p>
+<ol><li><strong>工具失败返回文本，而不是抛异常</strong>。模型需要看到错误来修正自己，</li></ol>
+<p>   抛异常会中断整个任务。</p>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-01.html">← 前言：为什么你要亲手写一个 agent</a><span></span><a href="ch-03.html">第 2 章 Milestone 1：跑通最小 agent loop →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

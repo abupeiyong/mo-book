@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>附录 B：命令与验收清单 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>附录 B：命令与验收清单</h1>
+<h2>B.1 环境变量</h2>
+<table><thead><tr><th>变量</th><th>含义</th><th>示例</th></tr></thead><tbody><tr><td><code>MO_API_KEY</code></td><td>发送在 <code>Authorization: Bearer</code> 头的密钥</td><td><code>sk-...</code></td></tr><tr><td><code>MO_BASE_URL</code></td><td>OpenAI 兼容 API 根地址（不含尾部斜杠）</td><td><code>https://api.openai.com/v1</code></td></tr><tr><td><code>MO_MODEL</code></td><td>模型名</td><td><code>gpt-4o-mini</code></td></tr></tbody></table>
+<h2>B.2 常用命令</h2>
+<pre><code>npm install                 # 安装 devDependencies（typescript / tsx / @types/node）
+npm run dev -- "&lt;prompt&gt;"   # 从源码运行（自动加载 .env）
+npm run typecheck           # tsc --noEmit
+npm test                    # node:test 测试
+npm run build               # 编译到 dist/
+npm run start -- "&lt;prompt&gt;" # 运行编译产物
+npm link &amp;&amp; mo "&lt;prompt&gt;"   # 全局安装并运行</code></pre>
+<h2>B.3 里程碑验收清单</h2>
+<p>Milestone 1：</p>
+<ul><li>[ ] 命令行接受 prompt，调用 OpenAI 兼容 API</li><li>[ ] 三个工具（read_file / write_file / run_shell）可被模型调用并本地执行</li><li>[ ] 工具结果按 tool_call_id 回填，循环直到最终答案</li><li>[ ] typecheck / build 通过；缺失环境变量时报错清晰</li></ul>
+<p>Milestone 2：</p>
+<ul><li>[ ] search_files：字面搜索、跳过 .git/node_modules/dist、200 条上限、path:line:content</li><li>[ ] edit_file：唯一匹配才替换；零/多次匹配不写文件（内容和 mtime 不变）</li><li>[ ] 路径边界：../ 拒绝、工作区外绝对路径拒绝、符号链接逃逸拒绝、悬空符号链接拒绝</li><li>[ ] 系统提示包含四条行为约束</li><li>[ ] npm test 覆盖以上全部场景</li><li>[ ] 自修改验收：<code>npm run dev -- --version</code> 输出 0.1.0，diff 最小</li></ul>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-07.html">← 附录 A：完整代码</a><span></span><a href="ch-09.html">后记：下一步 →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

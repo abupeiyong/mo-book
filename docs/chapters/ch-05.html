@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>第 4 章 经验与教训 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>第 4 章 经验与教训</h1>
+<p>两个里程碑做完，沉淀下来几条原则。</p>
+<h2>4.1 失败要返回给模型，而不是抛给上层</h2>
+<p>工具调用失败（未知工具、非法 JSON、命令非零退出）都以文本形式成为 <code>tool</code> 消息。模型看到错误、调整策略、重试。这是 agent 容错的核心机制。 抛异常中断循环只适用于"框架本身坏了"（比如模型返回了无法解析的响应）。</p>
+<h2>4.2 双人审查真的能抓到 bug</h2>
+<p>同一个实现让两个不同的 agent 各看一遍（Claude Code 实现，Codex 审查）， 审查者从"攻击者"角度写出了真实的逃逸路径。人肉 code review 的价值 在 agent 开发中同样成立，而且换个模型视角更容易跳出实现者的思维定式。</p>
+<h2>4.3 测试要覆盖真实入口</h2>
+<p>"typecheck/test/build 全绿但功能是坏的"在本项目真实发生过。 如果验收命令是 <code>npm run dev -- --version</code>，测试就应该包含加载 CLI 入口的冒烟测试。 模型的自我验证倾向于"跑项目提供的检查"，所以项目的检查必须真的能代表正确性。</p>
+<h2>4.4 诚实声明安全边界</h2>
+<p><code>path.ts</code> 的注释写着 "This is not a sandbox"。<code>run_shell</code> 可以访问任何地方， 所以文件工具限制不构成完整安全边界。假装有沙箱比没有沙箱更危险。 安全边界要么完整实现，要么明确声明并让用户知情。</p>
+<h2>4.5 最小化的艺术</h2>
+<p>两个里程碑都没有实现：TUI、MCP、记忆、子 agent、规划模式、权限系统、 上下文压缩。每一件都是"以后可能会需要"，但没有一件是"现在最小可用的必经之路"。 里程碑 2 完成后的指令是：<strong>停下来评估真实使用体验</strong>，不要急着堆功能。</p>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-04.html">← 第 3 章 Milestone 2：让 agent 可控地修改自己的代码</a><span></span><a href="ch-06.html">第 5 章 Milestone 3：让 agent 开口问（交互式会话） →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>第 5 章 Milestone 3：让 agent 开口问（交互式会话） · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>第 5 章 Milestone 3：让 agent 开口问（交互式会话）</h1>
+<h2>5.1 为什么是交互，而不是别的</h2>
+<p>Milestone 2 之后，用独立模型（DeepSeek）对代码做了一次只读 review，结论很直接： Mo 最大的短板不是能力，而是<strong>交互模型</strong>——fire-and-forget 的一次性批处理。</p>
+<pre><code>一个问题 → 跑一遍 → 看答案 → 不对？重新描述 → 再跑一遍</code></pre>
+<p>无法在任务中途说"不是这个文件"、"现在修一下那个 lint 错误"， 无法澄清歧义。这是"演示品"和"每天用的工具"之间最大的差距。</p>
+<p>候选方向里，review 为什么推荐<strong>交互式会话 + <code>ask_user</code></strong>，而不是别的：</p>
+<ul><li><strong>TUI</strong> 的价值 ~80% 来自交互（转向、反馈、迭代），但复杂度只有 ~20%。</li></ul>
+<p>  先做会话模块，它是未来 TUI 的地基。spec 里明确写着"这不是 TUI"。</p>
+<ul><li><strong>记忆</strong>没有会话就没有载体——跨运行记忆是 M4 的事，会话是前置条件。</li><li><strong>权限系统</strong>的种子就是 <code>ask_user</code>：让模型在破坏性操作前问人，</li></ul>
+<p>  而不是一开始就搭一套权限框架。</p>
+<ul><li>MCP、子 agent、规划、上下文压缩，都是"还没真实使用就感受不到问题"的东西。</li><li><strong>API 超时/重试</strong>捆绑进来：一个会无限挂起的 REPL 比会挂起的批处理更糟。</li></ul>
+<h2>5.2 <code>session.ts</code>：会话状态机（可测的核心）</h2>
+<p>关键设计：REPL 外壳（readline）保持薄，逻辑全部放在可测的 <code>session.ts</code>。 它不知道 readline 是什么，只做三件事：持有跨轮次的消息、每轮独立预算、 支持中断与提问。</p>
+<pre><code>export type Session = {
+  readonly messages: Message[];   // 会话历史：system + 每一轮
+  send(input: string, signal?: AbortSignal): Promise&lt;string&gt;;
+};
+
+export function createSession(options: SessionOptions): Session {
+  const chatFn = options.chat ?? chat;
+  // ask_user 只在交互会话里注册——批处理模式不暴露给模型
+  const definitions = options.askUser ? interactiveToolDefinitions() : toolDefinitions;
+  const messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
+
+  return {
+    messages,
+    async send(input, signal) {
+      signal?.throwIfAborted();
+      const turnStart = messages.length;
+      messages.push({ role: "user", content: input });
+      try {
+        // 预算按用户消息重置，而不是按会话累计
+        for (let turn = 0; turn &lt; MAX_TURNS; turn++) {
+          const reply = await chatFn(options.config, messages, definitions, signal);
+          signal?.throwIfAborted();
+          messages.push(reply);
+
+          if (!reply.tool_calls || reply.tool_calls.length === 0) {
+            if (reply.content === null) throw new Error("Model returned neither tool calls nor a final text response");
+            return reply.content;
+          }
+
+          for (const call of reply.tool_calls) {
+            signal?.throwIfAborted();
+            logToolCall(call);
+            const result = await executeTool(call.function.name, call.function.arguments, {
+              askUser: options.askUser,   // 注入式提问回调
+              signal,
+            });
+            signal?.throwIfAborted();
+            messages.push({ role: "tool", tool_call_id: call.id, content: result });
+          }
+        }
+        throw new Error(`Agent stopped after ${MAX_TURNS} turns without a final answer`);
+      } catch (error) {
+        // 失败的回合是原子的：绝不留下半截可能畸形或误导的历史给下一轮
+        messages.splice(turnStart);
+        throw error;
+      }
+    },
+  };
+}</code></pre>
+<p>值得记住的细节：<strong>失败的回合要原子回滚</strong>。如果模型回答了半截就超时/被中断， 把这段 user/assistant/tool 前缀从历史里剪掉，否则下一轮发给模型的历史会是畸形的。</p>
+<h2>5.3 <code>ask_user</code>：让模型开口问</h2>
+<p><code>ask_user(question)</code> 是一个特殊工具：执行时暂停当前回合，把问题打到终端， 读一行用户输入作为工具结果返回给模型，然后继续。实现是注入式的—— session 把提问回调传给工具执行层，测试里用桩回调，终端里用 readline：</p>
+<pre><code>export type AskUserPrompt = (question: string) =&gt; Promise&lt;string&gt;;
+
+export function createAskUserTool(ask: AskUserPrompt): Tool {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "ask_user",
+        description: "Ask the user a question and return their answer.",
+        parameters: {
+          type: "object",
+          properties: { question: { type: "string" } },
+          required: ["question"],
+        },
+      },
+    },
+    async execute(args) {
+      const question = args.question;
+      if (typeof question !== "string" || question === "") {
+        throw new Error("ask_user: 'question' must be a non-empty string");
+      }
+      return ask(question);
+    },
+  };
+}</code></pre>
+<p>两个重要的边界：</p>
+<ul><li><strong>只在交互会话注册</strong>（<code>interactiveToolDefinitions()</code>）。批处理模式下模型调用它，</li></ul>
+<p>  会得到一句 "not available in batch mode" 的文本提示，而不是崩溃。</p>
+<ul><li>系统提示只加一条行为约束：prompt 有歧义或下一步是破坏性/不可逆操作</li></ul>
+<p>  （删文件、丢弃未提交改动）时才提问；否则做合理假设并在答案里说明。   这是行为提示，不是权限框架。</p>
+<h2>5.4 超时与重试：不挂起、不重复执行</h2>
+<p><code>chat()</code> 原来没有超时——上游卡住，Mo 就永久挂着。M3 给它加了两件事：</p>
+<ul><li><strong>超时</strong>：<code>AbortController</code> 传给 <code>fetch</code>，超时中止并给出清晰错误。</li><li><strong>重试</strong>：只对瞬态错误（429、5xx、网络错误）重试，最多 2 次，指数退避；</li></ul>
+<p>  <strong>4xx 绝不重试</strong>（400/401 不是瞬态）。</p>
+<p>重试还有一个容易踩的坑：<strong>不能因为重试导致工具执行两次</strong>。 如果模型第一次的响应带了 <code>tool_calls</code> 但连接断了，重试会重新生成一次响应 （每次都是全新生成），模型可能又要执行同样的工具。测试用 stub 服务器 专门断言：503→503→200 时恰好发出 3 次请求、历史完全一致、 <strong>工具只执行一次</strong>。</p>
+<h2>5.5 REPL 外壳与 Ctrl+C 语义</h2>
+<p><code>mo</code> 无参数进入 REPL（<code>node:readline/promises</code>，零依赖）。 Ctrl+C 的语义很容易写错，spec 定义得清清楚楚：</p>
+<ul><li><strong>单次 Ctrl+C</strong>：中断当前正在进行的回合（中止模型 fetch、杀掉正在跑的 shell），</li></ul>
+<p>  留在 REPL 里继续。</p>
+<ul><li><strong>连续两次 Ctrl+C</strong>：退出。</li></ul>
+<p>"单次中断要杀掉正在跑的 shell"是个隐蔽的坑： 如果只是中止 readline 等待，<code>run_shell</code> 里的 <code>sleep</code> 或长命令还会在后台继续。 M3 让 AbortSignal 一路传到 <code>exec</code> 的子进程，中断才真正生效。</p>
+<h2>5.6 冒烟测试：把 4.3 的教训写进测试</h2>
+<p>Milestone 2 的真实教训是"typecheck/test/build 全绿但 <code>--version</code> 是坏的" （测试不加载 CLI 入口）。M3 的测试直接覆盖<strong>构建产物</strong>：</p>
+<ul><li>跑 <code>node dist/index.js --version</code>，断言输出；</li><li>用本地 stub 服务器跑完整批处理（prompt → 工具调用 → 最终答案）；</li><li>交互模式：向 stdin 写一行，跑完一轮，EOF 干净退出。</li></ul>
+<p>会话与重试逻辑用桩模型/桩服务器测试（确定性、无网络）， CLI 外壳用真实子进程测试（覆盖入口）。两层都不依赖真实 API。</p>
+<h2>5.7 审查实录：Codex 又抓到四个 bug</h2>
+<p>实现完成后照例让第二个 agent（Codex）独立审查，从"攻击者"视角又找出四个：</p>
+<ol><li><strong><code>ask_user</code> 注册泄漏到批处理</strong>：全局注册让批处理模式也把 <code>ask_user</code></li></ol>
+<p>   暴露给了模型。修复：只有交互会话才注册。</p>
+<ol><li><strong>Ctrl+C 没有传播到 <code>run_shell</code></strong>：中断只中止了模型等待，</li></ol>
+<p>   正在跑的 shell 命令（包括它的延迟副作用）还在继续。修复：    AbortSignal 一路传到子进程。</p>
+<ol><li><strong>中断的回合残留半截历史</strong>：用户/助理/工具前缀留在消息数组里，</li></ol>
+<p>   下一轮会发给模型。修复：失败回合原子回滚（5.2 的 <code>splice</code>）。</p>
+<ol><li><strong>EOF 时 <code>ask_user</code> 被当成普通工具错误</strong>：用户 Ctrl+D 退出时回合还在继续。</li></ol>
+<p>   修复：EOF 中止当前回合。</p>
+<p>每条都值得写进书里——尤其 2 和 3，是"交互式 agent"这类系统独有的、 批处理时代完全不会出现的 bug 类别。</p>
+<h2>5.8 真实 API 验证</h2>
+<p>测试全部桩化之后，还要用真实模型各跑一遍两种入口：</p>
+<pre><code>$ npm run dev -- "Reply with exactly: BATCH-OK"
+BATCH-OK
+
+$ printf 'Reply with exactly: REPL-OK\n' | npm run dev
+Mo interactive session (gpt-4o-mini). Ctrl+C interrupts the current turn; Ctrl+C twice or Ctrl+D exits.
+mo&gt; REPL-OK</code></pre>
+<p>至此 Mo 有了第三根支柱：<strong>能对话、会提问、不会挂死</strong>。</p>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-05.html">← 第 4 章 经验与教训</a><span></span><a href="ch-07.html">附录 A：完整代码 →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

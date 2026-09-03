@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>后记：下一步 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>后记：下一步</h1>
+<p>三个里程碑走下来，Mo 已经：能搜索、读取、精确编辑自己的代码（M2）， 能对话、会提问、不会挂死（M3）。每一步之后都停下来真实使用， 再根据手感决定下一步。目前排在前面的候选：</p>
+<ul><li><strong>跨运行记忆（<code>--continue</code>）</strong>：会话有了，但进程一退出历史就没了。</li></ul>
+<p>  会话持久化是自然的下一个台阶（M3 spec 明确留给 M4）。</p>
+<ul><li><strong>权限系统</strong>：<code>ask_user</code> 是种子——让模型在破坏性操作前询问，</li></ul>
+<p>  逐步取代"诚实的非沙箱"声明。</p>
+<ul><li><strong>真正的 TUI</strong>：会话模块已经就位，它是 TUI 的地基。</li><li><strong>加固类小项</strong>：<code>read_file</code> 大小上限、<code>.env</code> 解析器、<code>--help</code>。</li><li>MCP、多 agent 协作、上下文压缩：等真实使用暴露出问题再说。</li></ul>
+<p>每一件都值得做，但每一件都要在"最小可用"之后才做。 三步诞生记仍在继续。</p>
+<p>*—— 感谢 Claude Code 与 Codex 作为开发与审查伙伴，也感谢 Mo 自己改掉了自己写下的 bug。*</p>
+</article>
+<nav class="pager"><a href="ch-08.html">← 附录 B：命令与验收清单</a><span></span><a href="../index.html">回到目录</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

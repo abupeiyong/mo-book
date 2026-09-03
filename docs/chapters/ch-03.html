@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>第 2 章 Milestone 1：跑通最小 agent loop · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>第 2 章 Milestone 1：跑通最小 agent loop</h1>
+<h2>2.1 目标与验收</h2>
+<p>Milestone 1 的最小可用版本要满足：</p>
+<ol><li>从命令行接受用户 prompt</li><li>发送给 OpenAI 兼容的 LLM API</li><li>让模型可以调用工具</li><li>支持三个初始工具：<code>read_file</code>、<code>write_file</code>、<code>run_shell</code></li><li>本地执行工具调用</li><li>把工具结果回填给模型</li><li>循环直到模型返回最终文本</li><li>把最终答案打印到终端</li></ol>
+<p>验收命令长这样：</p>
+<pre><code>MO_API_KEY=... \
+MO_BASE_URL=https://api.example.com/v1 \
+MO_MODEL=some-model \
+npm run dev -- "read package.json and tell me the project name"</code></pre>
+<h2>2.2 项目结构</h2>
+<pre><code>mo/
+├── src/
+│   ├── index.ts          # CLI 入口
+│   ├── agent.ts          # 核心循环
+│   ├── model.ts          # OpenAI 兼容客户端
+│   └── tools/
+│       ├── index.ts      # 工具注册表 + 分发器
+│       ├── read-file.ts  # read_file
+│       ├── write-file.ts # write_file
+│       └── run-shell.ts  # run_shell
+├── package.json
+├── tsconfig.json
+└── README.md</code></pre>
+<p>整个代码库约 250 行。这个规模是刻意为之：一个人应该能一次读完。</p>
+<h2>2.3 <code>model.ts</code>：用原生 fetch 说 OpenAI 的话</h2>
+<p>先定义类型，再写函数。类型先行是因为 agent 的数据流很容易出错：</p>
+<pre><code>// 模型看到的世界：一个工具 = OpenAI "function" 格式的 JSON Schema
+export type ToolDefinition = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record&lt;string, unknown&gt;;
+  };
+};
+
+// 模型发出的调用请求：参数以 JSON 字符串形式到达
+export type ToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+// 消息历史上允许出现的四种角色
+export type Message =
+  | { role: "system"; content: string }
+  | { role: "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };</code></pre>
+<p>注意 <code>arguments: string</code>——模型返回的工具参数是 <strong>JSON 字符串</strong>， 执行前要自己 <code>JSON.parse</code>，这是 agent 工程里最常见的坑之一。</p>
+<p>配置从环境变量读，三个：<code>MO_API_KEY</code>、<code>MO_BASE_URL</code>、<code>MO_MODEL</code>：</p>
+<pre><code>export function configFromEnv(): ModelConfig {
+  return {
+    apiKey: requireEnv("MO_API_KEY"),
+    baseUrl: requireEnv("MO_BASE_URL").replace(/\/+$/, ""),
+    model: requireEnv("MO_MODEL"),
+  };
+}</code></pre>
+<p><code>chat()</code> 是唯一的 HTTP 入口：</p>
+<pre><code>export async function chat(
+  config: ModelConfig,
+  messages: Message[],
+  tools: ToolDefinition[],
+): Promise&lt;AssistantMessage&gt; {
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify({ model: config.model, messages, tools }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Model API error ${response.status}: ${await response.text()}`);
+  }
+
+  const data = (await response.json()) as ChatCompletionResponse;
+  const message = data.choices[0]?.message;
+  if (!message) {
+    throw new Error("Model API returned no choices");
+  }
+
+  // 只保留我们认识的字段，回传时历史保持干净
+  return { role: "assistant", content: message.content ?? null, tool_calls: message.tool_calls };
+}</code></pre>
+<p>两个容易被忽略的设计点：</p>
+<ul><li><strong><code>content: null</code> 的表示</strong>。模型要调用工具时，<code>content</code> 通常为 <code>null</code>。</li></ul>
+<p>  我们把它归一化成 <code>string | null</code>，循环里据此判断"这轮是工具调用还是最终答案"。</p>
+<ul><li><strong>只保留认识的字段</strong>。不同厂商会在响应里塞各种额外字段，</li></ul>
+<p>  回传时只带 <code>content</code> 和 <code>tool_calls</code>，避免污染消息历史。</p>
+<h2>2.4 <code>tools</code>：工具 = "定义 + 执行"</h2>
+<p>每个工具是一个对象，一半给模型看（JSON Schema），一半在本地跑（函数）：</p>
+<pre><code>export type Tool = {
+  definition: ToolDefinition;          // 模型看到的
+  execute: (args: Record&lt;string, unknown&gt;) =&gt; Promise&lt;string&gt;;  // 本地执行的
+};</code></pre>
+<p>以 <code>read_file</code> 为例：</p>
+<pre><code>export const readFileTool: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a UTF-8 text file and return its full contents.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path relative to the workspace root." },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  async execute(args) {
+    const path = args.path;
+    if (typeof path !== "string") {
+      throw new Error("read_file: 'path' must be a string");
+    }
+    return readFile(path, "utf8");
+  },
+};</code></pre>
+<p><code>write_file</code> 会创建父目录并覆盖写入；<code>run_shell</code> 用 <code>child_process.exec</code> 执行命令，把退出码、stdout、stderr 一并返回。注意 <code>run_shell</code> 的失败处理：</p>
+<pre><code>return new Promise((resolve) =&gt; {
+  exec(command, { timeout: TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) =&gt; {
+    // 非零退出码以文本返回给模型，而不是抛异常
+    const exitCode = error ? (error.code ?? "unknown") : 0;
+    resolve(`exit code: ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+  });
+});</code></pre>
+<p><code>tools/index.ts</code> 是注册表 + 分发器。agent 循环只和它对话，从不直接碰工具：</p>
+<pre><code>const tools: Tool[] = [readFileTool, writeFileTool, runShellTool];
+
+export const toolDefinitions: ToolDefinition[] = tools.map((tool) =&gt; tool.definition);
+
+export async function executeTool(name: string, rawArgs: string): Promise&lt;string&gt; {
+  const tool = tools.find((t) =&gt; t.definition.function.name === name);
+  if (!tool) {
+    return `Error: unknown tool "${name}"`;   // 未知工具也返回文本
+  }
+  try {
+    const args = (rawArgs.trim() === "" ? {} : JSON.parse(rawArgs)) as Record&lt;string, unknown&gt;;
+    return await tool.execute(args);
+  } catch (error) {
+    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}</code></pre>
+<p><strong>"失败返回文本而不是抛异常"</strong> 是贯穿全书的设计哲学： agent 的容错不靠 try/catch 兜底，而靠"把错误信息喂回给模型，让它自己修正"。</p>
+<h2>2.5 <code>agent.ts</code>：核心循环</h2>
+<p>循环本身只有三十多行：</p>
+<pre><code>export async function runAgent(config: ModelConfig, prompt: string): Promise&lt;string&gt; {
+  const messages: Message[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: prompt },
+  ];
+
+  for (let turn = 0; turn &lt; MAX_TURNS; turn++) {
+    const reply = await chat(config, messages, toolDefinitions);
+    messages.push(reply);
+
+    // 没有工具调用 → 这就是最终答案
+    if (!reply.tool_calls || reply.tool_calls.length === 0) {
+      if (reply.content === null) {
+        throw new Error("Model returned neither tool calls nor a final text response");
+      }
+      return reply.content;
+    }
+
+    // 执行每个工具调用，把结果作为 "tool" 消息追加，然后回到循环顶部
+    for (const call of reply.tool_calls) {
+      console.error(`[tool] ${call.function.name} ${call.function.arguments}`);
+      const result = await executeTool(call.function.name, call.function.arguments);
+      messages.push({ role: "tool", tool_call_id: call.id, content: result });
+    }
+  }
+
+  throw new Error(`Agent stopped after ${MAX_TURNS} turns without a final answer`);
+}</code></pre>
+<p>要点：</p>
+<ul><li><strong><code>MAX_TURNS = 50</code></strong>：防一个糊涂模型无限循环烧钱。这是最小成本保护。</li><li><strong><code>tool_call_id</code> 回填</strong>：OpenAI 协议要求每条 <code>tool</code> 消息带上对应的调用 ID，</li></ul>
+<p>  否则模型无法把结果关联到调用。这是最容易写错、又必须正确的地方。</p>
+<ul><li><strong>一次可能有多条 tool_calls</strong>：模型一轮可以并行要多个工具，逐个执行即可</li></ul>
+<p>  （milestone 2 明确选择保持顺序执行，确定性优先于并行优化）。</p>
+<ul><li><strong>工具痕迹打 stderr</strong>：<code>console.error</code> 让 stdout 只输出最终答案，</li></ul>
+<p>  方便用户管道化使用。</p>
+<h2>2.6 <code>index.ts</code>：CLI 边界</h2>
+<pre><code>const prompt = process.argv.slice(2).join(" ").trim();
+if (!prompt) {
+  console.error('Usage: npm run dev -- "&lt;prompt&gt;"');
+  process.exit(1);
+}
+
+try {
+  const answer = await runAgent(configFromEnv(), prompt);
+  console.log(answer);
+} catch (error) {
+  console.error(`mo: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}</code></pre>
+<p>（<code>--version</code> 选项是 milestone 2 的产物，见 3.7 节的实录。）</p>
+<h2>2.7 端到端验证：一个 mock 服务器</h2>
+<p>没有真实 API key 也能验证循环吗？能。写一个假的 OpenAI 兼容服务器， 用脚本模拟模型行为：</p>
+<ul><li>第一次收到请求（最后一条是 user 消息）→ 返回一个 <code>read_file("package.json")</code> 工具调用</li><li>第二次收到请求（最后一条是 tool 消息）→ 返回最终答案</li></ul>
+<p>跑一遍 <code>npm run dev -- "read package.json and tell me the project name"</code>， 观察消息序列是否正确变成了 <code>system → user → assistant(tool_calls) → tool → assistant(final)</code>。</p>
+<p>这个技巧贯穿整个开发：<strong>没有真模型也能验证协议正确性</strong>。 Milestone 2 的自修改验收则是反过来——用真模型，但让它改自己的代码。</p>
+<h2>2.8 里程碑 1 的验收结果</h2>
+<ul><li><code>npm run typecheck</code>、<code>npm run build</code> 通过，零错误</li><li>mock 端到端：工具调用被正确执行，结果按 <code>tool_call_id</code> 回填，</li></ul>
+<p>  最终答案打印，退出码 0</p>
+<ul><li>未知工具、非零退出码都作为文本返回给模型，不崩溃</li><li>缺环境变量 / 无 prompt 时给出清晰错误，退出码 1</li></ul>
+<p>第一个里程碑到此完成。Mo 现在是一个能读文件、写文件、跑命令并汇报结果的最小 agent。 但它还不能"改好自己的代码"——<code>write_file</code> 会盲目覆盖整个文件，模型找不到代码在哪， 也没有任何测试保护。这正是 Milestone 2 要解决的。</p>
+<hr/>
+</article>
+<nav class="pager"><a href="ch-02.html">← 第 1 章 全景：一个 code agent 的最小组成</a><span></span><a href="ch-04.html">第 3 章 Milestone 2：让 agent 可控地修改自己的代码 →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>

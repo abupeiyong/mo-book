@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Build mo-book.epub from manuscript.md. Zero dependencies:
-// - Markdown -> XHTML: this script (line-based, supports the subset used in the book)
+// - Markdown -> XHTML: lib/book.mjs (shared with the Pages site build)
 // - EPUB container: the macOS /usr/bin/zip CLI (mimetype stored first, uncompressed)
 //
 // Usage: node build.mjs
@@ -9,162 +9,12 @@ import { readFileSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BOOK, esc, inline, mdToXhtml, splitChapters } from "./lib/book.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MANUSCRIPT = join(HERE, "manuscript.md");
 const STAGE = join(HERE, "build", "epub");
 const OUT = join(HERE, "build", "mo-book.epub");
-
-const BOOK = {
-  title: "从零搭建你自己的 Code Agent",
-  subtitle: "Mo 开发实录：一个最小 AI 编程助手的三步诞生记",
-  author: "peiyong",
-  language: "zh-CN",
-  date: "2026-08-31",
-  id: `urn:uuid:${crypto.randomUUID()}`,
-};
-
-// ---------------------------------------------------------------- markdown
-
-const esc = (s) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-// Escape HTML, then apply bold and inline code (in that order).
-function inline(text) {
-  let out = esc(text);
-  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
-  return out;
-}
-
-const cell = (c) => `<td>${inline(c.trim())}</td>`;
-const headCell = (c) => `<th>${inline(c.trim())}</th>`;
-
-const isSep = (r) => /^\s*\|?[\s:|-]+\|?\s*$/.test(r) && r.includes("-");
-
-function tableBlock(rows) {
-  const head = rows[0];
-  const body = rows.slice(2); // row[1] is the --- separator
-  const thead = `<tr>${head.split("|").filter((c) => c.trim() !== "").map(headCell).join("")}</tr>`;
-  const tbody = body
-    .map((r) => `<tr>${r.split("|").filter((c) => c.trim() !== "").map(cell).join("")}</tr>`)
-    .join("");
-  return `<table><thead>${thead}</thead><tbody>${tbody}</tbody></table>`;
-}
-
-// Convert one chapter's markdown body (without the h1) to XHTML.
-function mdToXhtml(body) {
-  const lines = body.replace(/\r\n/g, "\n").split("\n");
-  const out = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // fenced code block
-    if (line.startsWith("```")) {
-      const buf = [];
-      i++;
-      while (i < lines.length && !lines[i].startsWith("```")) {
-        buf.push(lines[i]);
-        i++;
-      }
-      i++; // closing fence
-      out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`);
-      continue;
-    }
-
-    // horizontal rule
-    if (/^\s*---+\s*$/.test(line)) {
-      out.push("<hr/>");
-      i++;
-      continue;
-    }
-
-    // headings
-    const h = line.match(/^(#{1,4})\s+(.+)$/);
-    if (h) {
-      const level = h[1].length;
-      out.push(`<h${level}>${inline(h[2])}</h${level}>`);
-      i++;
-      continue;
-    }
-
-    // table: header row, then a separator row
-    if (line.includes("|") && i + 1 < lines.length && isSep(lines[i + 1])) {
-      const rows = [line];
-      i++;
-      while (i < lines.length && lines[i].includes("|")) {
-        rows.push(lines[i]);
-        i++;
-      }
-      out.push(tableBlock(rows));
-      continue;
-    }
-
-    // unordered list
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-        items.push(`<li>${inline(lines[i].replace(/^\s*[-*]\s+/, ""))}</li>`);
-        i++;
-      }
-      out.push(`<ul>${items.join("")}</ul>`);
-      continue;
-    }
-
-    // ordered list
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        items.push(`<li>${inline(lines[i].replace(/^\s*\d+\.\s+/, ""))}</li>`);
-        i++;
-      }
-      out.push(`<ol>${items.join("")}</ol>`);
-      continue;
-    }
-
-    // blockquote
-    if (/^\s*>\s?/.test(line)) {
-      const buf = [];
-      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
-        buf.push(lines[i].replace(/^\s*>\s?/, ""));
-        i++;
-      }
-      out.push(`<blockquote>${mdToXhtml(buf.join("\n"))}</blockquote>`);
-      continue;
-    }
-
-    // blank line
-    if (line.trim() === "") {
-      i++;
-      continue;
-    }
-
-    // paragraph: consume until blank line or another block start
-    const buf = [line];
-    i++;
-    while (
-      i < lines.length &&
-      lines[i].trim() !== "" &&
-      !lines[i].startsWith("```") &&
-      !/^(#{1,4})\s+/.test(lines[i]) &&
-      !/^\s*[-*]\s+/.test(lines[i]) &&
-      !/^\s*\d+\.\s+/.test(lines[i]) &&
-      !/^\s*>\s?/.test(lines[i]) &&
-      !/^\s*---+\s*$/.test(lines[i]) &&
-      !(lines[i].includes("|") && i + 1 < lines.length && isSep(lines[i + 1]))
-    ) {
-      buf.push(lines[i]);
-      i++;
-    }
-    out.push(`<p>${inline(buf.join(" "))}</p>`);
-  }
-
-  return out.join("\n");
-}
-
-// ---------------------------------------------------------------- epub files
 
 const chapterDoc = (body) => `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -220,20 +70,9 @@ hr { border: none; border-top: 1px solid #ccc; margin: 2em 0; }
 .cover-author { color: #888; margin-top: 3em; }
 `;
 
-// ---------------------------------------------------------------- build
-
 function build() {
   const md = readFileSync(MANUSCRIPT, "utf8");
-
-  // Split into chapters by top-level "# " headings.
-  const parts = md.split(/^#\s+(.+)$/m);
-  // parts[0] = front matter, then alternating [title, body, title, body, ...]
-  const chapters = [];
-  for (let i = 1; i + 1 < parts.length; i += 2) {
-    chapters.push({ title: parts[i].trim(), body: parts[i + 1] });
-  }
-  // The very first "# " is the book title (front matter) — drop it.
-  const realChapters = chapters.slice(1);
+  const tocEntries = splitChapters(md);
 
   if (existsSync(STAGE)) rmSync(STAGE, { recursive: true, force: true });
   mkdirSync(join(STAGE, "META-INF"), { recursive: true });
@@ -244,23 +83,18 @@ function build() {
   writeFileSync(join(STAGE, "OEBPS", "style.css"), CSS, "utf8");
   writeFileSync(join(STAGE, "OEBPS", "cover.xhtml"), coverDoc(), "utf8");
 
-  const xhtmls = [];
   const spine = ["cover"];
-  const tocEntries = [];
-
-  realChapters.forEach((ch, idx) => {
+  const xhtmls = tocEntries.map((ch, idx) => {
     const n = String(idx + 1).padStart(2, "0");
     const file = `chapter-${n}.xhtml`;
-    writeFileSync(join(STAGE, "OEBPS", file), chapterDoc(`<h1>${inline(ch.title)}</h1>\n${mdToXhtml(ch.body)}`), "utf8");
-    xhtmls.push({ file, title: ch.title });
+    const doc = chapterDoc(`<h1>${inline(ch.title)}</h1>\n${mdToXhtml(ch.body)}`);
+    writeFileSync(join(STAGE, "OEBPS", file), doc, "utf8");
     spine.push(file);
-    tocEntries.push({ id: `ch-${n}`, file, title: ch.title });
+    return { file, title: ch.title };
   });
 
-  // EPUB3 nav (optional, helps newer readers)
-  const navItems = tocEntries
-    .map((t) => `<li><a href="${t.file}">${esc(t.title)}</a></li>`)
-    .join("\n");
+  // EPUB3 nav
+  const navItems = tocEntries.map((t) => `<li><a href="${t.file}">${esc(t.title)}</a></li>`).join("\n");
   writeFileSync(
     join(STAGE, "OEBPS", "nav.xhtml"),
     `<?xml version="1.0" encoding="UTF-8"?>
@@ -283,7 +117,9 @@ function build() {
     `<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>`,
     ...xhtmls.map((x, i) => `<item id="x${String(i + 1).padStart(2, "0")}" href="${x.file}" media-type="application/xhtml+xml"/>`),
   ].join("\n  ");
-  const spineRefs = spine.map((f) => `<itemref idref="${f === "cover" ? "cover" : "x" + String(tocEntries.findIndex((t) => t.file === f) + 1).padStart(2, "0")}"/>`).join("\n  ");
+  const spineRefs = spine
+    .map((f) => `<itemref idref="${f === "cover" ? "cover" : "x" + String(spine.indexOf(f)).padStart(2, "0")}"/>`)
+    .join("\n  ");
 
   const opf = `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
@@ -291,7 +127,7 @@ function build() {
     <dc:title>${esc(BOOK.title)}</dc:title>
     <dc:creator opf:role="aut">${esc(BOOK.author)}</dc:creator>
     <dc:language>${BOOK.language}</dc:language>
-    <dc:identifier id="bookid">${BOOK.id}</dc:identifier>
+    <dc:identifier id="bookid">urn:uuid:${crypto.randomUUID()}</dc:identifier>
     <dc:date>${BOOK.date}</dc:date>
     <dc:description>${esc(BOOK.subtitle)}</dc:description>
     <meta name="generator" content="mo-book build script"/>
@@ -307,12 +143,12 @@ function build() {
   writeFileSync(join(STAGE, "OEBPS", "content.opf"), opf, "utf8");
 
   const navPoints = tocEntries
-    .map((t, i) => `<navPoint id="${t.id}" playOrder="${i + 1}"><navLabel><text>${esc(t.title)}</text></navLabel><content src="${t.file}"/></navPoint>`)
+    .map((t, i) => `<navPoint id="ch-${String(i + 1).padStart(2, "0")}" playOrder="${i + 1}"><navLabel><text>${esc(t.title)}</text></navLabel><content src="${t.file}"/></navPoint>`)
     .join("\n  ");
   const ncx = `<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
   <head>
-    <meta name="dtb:uid" content="${BOOK.id}"/>
+    <meta name="dtb:uid" content="urn:uuid:${crypto.randomUUID()}"/>
     <meta name="dtb:depth" content="1"/>
     <meta name="dtb:totalPageCount" content="0"/>
     <meta name="dtb:maxPageNumber" content="0"/>
@@ -325,7 +161,6 @@ function build() {
 `;
   writeFileSync(join(STAGE, "OEBPS", "toc.ncx"), ncx, "utf8");
 
-  // Zip it. mimetype must be first and stored (no compression).
   execFileSync("zip", ["-X0", OUT, "mimetype"], { cwd: STAGE });
   execFileSync("zip", ["-Xr9D", OUT, "META-INF", "OEBPS"], { cwd: STAGE });
 

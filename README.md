@@ -9,13 +9,21 @@
 | 文件 | 说明 |
 | --- | --- |
 | `manuscript.md` | 书稿（Markdown 源文件，可读、可版本化、可在 GitHub 直接看） |
+| `lib/book.mjs` | 共享 Markdown 解析（EPUB 与网页站共用） |
 | `build.mjs` | 构建脚本：Markdown → XHTML → EPUB（零依赖，用 macOS 自带 `zip`） |
+| `build-site.mjs` | 构建脚本：生成 `docs/` 静态阅读站（GitHub Pages） |
+| `docs/` | 生成的在线阅读站（GitHub Pages 发布源） |
 | `build/mo-book.epub` | 生成的电子书，可直接导入 Apple Books / Kindle / 其他阅读器 |
+
+## 在线阅读
+
+**https://abupeiyong.github.io/mo-book/**（GitHub Pages，自动从 `main` 分支的 `docs/` 发布）
 
 ## 构建
 
 ```bash
 node build.mjs        # 重新生成 build/mo-book.epub
+node build-site.mjs   # 重新生成 docs/ 在线阅读站
 ```
 
 ## 内容结构

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>前言：为什么你要亲手写一个 agent · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<link rel="stylesheet" href="../style.css"/>
+</head>
+<body>
+<header class="site"><div class="inner">
+  <span class="book-title"><a href="../index.html">从零搭建你自己的 Code Agent</a></span>
+  <span><a href="../index.html">目录</a></span>
+</div></header>
+<div class="wrap">
+
+<article>
+<h1>前言：为什么你要亲手写一个 agent</h1>
+<p>如果你正在读这本书，大概率你已经在用 Claude Code、Codex、Cursor 或类似的 AI 编程助手。 它们很强大，但对你来说是一个黑盒：提示词是怎么拼的？工具是怎么调用的？循环是怎么终止的？ 为什么它会突然犯低级错误？</p>
+<p><strong>亲手写一个最小的 agent，是理解这一切的最好方式。</strong></p>
+<p>Mo 是一个只有几百行 TypeScript 的小项目，目标是：</p>
+<ul><li>理解并掌控 agent 核心循环，而不是依赖 LangChain 这类框架</li><li>保持足够小，让一个人能在一次坐下读完整个代码库</li><li>不引入任何 agent 框架、不引入任何运行时依赖</li><li>最终让 Mo 能够修改自己的源代码</li></ul>
+<p>本书记录 Mo 两个里程碑的完整开发过程。<strong>Milestone 1</strong> 是让最小工具调用循环跑通： CLI 接收 prompt → 发给 OpenAI 兼容 API → 模型调用工具 → 本地执行 → 结果回填 → 循环直到模型给出最终答案。<strong>Milestone 2</strong> 是可控的自修改：给 Mo 加上"定位代码" （search_files）和"精确修改代码"（edit_file）的能力，并让路径边界、唯一匹配语义 和测试保证它不会乱改东西。</p>
+<p>在开发过程中发生了很多值得写下来的事：模型在自修改时引入了 ESM 的坑又自己修好、 审查者发现了一个真实的符号链接逃逸漏洞、"测试全绿但入口是坏的"这类经典盲区。 这些故事比任何框架教程都更能教会你 agent 工程。</p>
+<p>本书不是理论书。每一章都对应真实存在的代码，附录里有完整的源码。 你可以一边读一边把代码跑起来。</p>
+<hr/>
+</article>
+<nav class="pager"><span class="empty">← 目录</span><span></span><a href="ch-02.html">第 1 章 全景：一个 code agent 的最小组成 →</a></nav>
+</div>
+<footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
+</body>
+</html>
