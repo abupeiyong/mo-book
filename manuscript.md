@@ -1,6 +1,6 @@
 # 从零搭建你自己的 Code Agent
 
-## Mo 开发实录：一个最小 AI 编程助手的三步诞生记
+## Mo 开发实录：一个最小 AI 编程助手的四步诞生记
 
 ——不依赖 LangChain、不依赖 Vercel AI SDK，只用 TypeScript、Node.js 和原生 fetch，
 从第一行代码开始，理解并掌控 agent 的核心循环。
@@ -19,18 +19,20 @@
 
 **亲手写一个最小的 agent，是理解这一切的最好方式。**
 
-Mo 是一个只有几百行 TypeScript 的小项目，目标是：
+Mo 是一个一千来行 TypeScript 的小项目，目标是：
 
 - 理解并掌控 agent 核心循环，而不是依赖 LangChain 这类框架
 - 保持足够小，让一个人能在一次坐下读完整个代码库
 - 不引入任何 agent 框架、不引入任何运行时依赖
 - 最终让 Mo 能够修改自己的源代码
 
-本书记录 Mo 两个里程碑的完整开发过程。**Milestone 1** 是让最小工具调用循环跑通：
+本书记录 Mo 四个里程碑的完整开发过程。**Milestone 1** 是让最小工具调用循环跑通：
 CLI 接收 prompt → 发给 OpenAI 兼容 API → 模型调用工具 → 本地执行 → 结果回填 →
 循环直到模型给出最终答案。**Milestone 2** 是可控的自修改：给 Mo 加上"定位代码"
 （search_files）和"精确修改代码"（edit_file）的能力，并让路径边界、唯一匹配语义
-和测试保证它不会乱改东西。
+和测试保证它不会乱改东西。**Milestone 3** 是交互式会话：REPL、超时重试，以及让
+模型在歧义或破坏性操作前开口问人（ask_user）。**Milestone 4** 是模型选择与多
+provider 配置：一份 providers.json，就能在对话里随时换模型、换端点而不丢历史。
 
 在开发过程中发生了很多值得写下来的事：模型在自修改时引入了 ESM 的坑又自己修好、
 审查者发现了一个真实的符号链接逃逸漏洞、"测试全绿但入口是坏的"这类经典盲区。
@@ -884,10 +886,193 @@ mo> REPL-OK
 
 ---
 
+# 第 6 章 Milestone 4：模型选择与多 provider 配置
+
+## 6.1 优先级变化：为什么是模型选择
+
+M3 收尾时，spec 给 M4 排的候选是**跨运行记忆**——会话有了，进程一退出历史就没了，
+持久化看起来是自然的下一个台阶。但真实用了几天之后，一个更基础的痛点先冒了出来：
+
+切换模型要改环境变量、重启、重新描述任务。
+
+```text
+$ MO_MODEL=deepseek-chat MO_BASE_URL=... mo "帮我看看这个 bug"
+```
+
+想换个模型？得改 `.env` / `export`，或者干脆退出重来、丢掉整段对话。
+
+手里其实有好几个可用的端点——OpenAI、DeepSeek、公司内部的 bllm 网关——但 Mo 只认
+一套环境变量三件套，等价于"只有一个 provider"。想换个更强的模型继续同一段对话，
+只能退出重来。这不是新能力，而是**让已有能力可切换**，优先级更高。
+
+于是 M4 的目标收敛成一句话：**配置化多个 provider + 会话内/命令行切换模型**，
+同时保持零依赖和向后兼容——没有配置文件时，行为与 M3 逐字节一致。
+
+## 6.2 一个架构决策：单协议
+
+动工前先定下一个会影响后续所有工作的决策：**Mo 只认 OpenAI-compatible 的
+`/chat/completions`，不实现原生 Anthropic Messages API，也不预留任何 `protocol`
+字段。**
+
+理由一句话：OpenAI-compatible 已经是 LLM 的通用语——OpenAI、DeepSeek、GLM、Qwen、
+OpenRouter、内部网关全都提供；想用 Claude，配一个 OpenAI 兼容的端点就行。
+
+这条不是拍脑袋，是实测出来的。M4 动工前用 `anthropic/claude-sonnet-5`（经 OpenRouter
+的 OpenAI 兼容端点）跑了一遍完整工具调用协议：tools schema → `tool_calls` → OpenAI
+格式的工具结果回填，全部正常。既然第二协议带来的只是一层翻译器，而收益为零，
+那就干脆不写。
+
+这个决策还落到了代码里——`config.ts` 的校验器**显式拒绝** `protocol` 字段：
+
+```ts
+if ("protocol" in entry) throw invalid(path, `${where}: "protocol" is not supported; use an OpenAI-compatible endpoint`);
+```
+
+不是"忽略未知字段"，而是"明确报错"。将来某天真要直连纯 Anthropic 端点，报错信息
+会告诉你这是刻意不做，而不是漏做。
+
+## 6.3 providers.json 与 resolveConfig：配置从哪来
+
+新增 `src/config.ts`，只承担一件事：**把"我想用谁"解析成一份完整的 `ModelConfig`**。
+
+配置文件默认在 `~/.config/mo/providers.json`（`MO_CONFIG` 可覆盖路径），形如：
+
+```json
+{
+  "default": "openai",
+  "providers": [
+    { "name": "openai",   "apiKey": "sk-...", "baseUrl": "https://api.openai.com/v1",        "model": "gpt-4o-mini" },
+    { "name": "deepseek", "apiKey": "sk-...", "baseUrl": "https://api.deepseek.com",          "model": "deepseek-chat" },
+    { "name": "bllm",     "apiKey": "sk-...", "baseUrl": "https://bllm.discover.botim.io/v1", "model": "glm-5.3-flash" }
+  ]
+}
+```
+
+优先级从高到低，`resolveConfig` 里一眼就能读完：
+
+```ts
+export function resolveConfig(flags: Flags = {}, file: ProvidersFile | null = loadProviders(), session: Flags = {}): ResolvedConfig {
+  const name = flags.provider ?? session.provider ?? file?.default;
+  const model = flags.model ?? session.model;
+  if (file === null) {
+    if (name !== undefined) throw new Error(`No providers file at ${configPath()} (--provider needs one)`);
+    const config = configFromEnv();   // 无文件：回到 M3 的环境变量三件套
+    return { config: model === undefined ? config : { ...config, model } };
+  }
+  if (name === undefined) throw new Error("No default provider in providers file; choose one with --provider <name> or set default");
+  const provider = findProvider(file, name);
+  return { provider: provider.name, config: configFromProvider(provider, model) };
+}
+```
+
+- **CLI flags**（`--provider` / `--model`）最高；
+- 然后是 **REPL 会话内切换**（`session` 参数）；
+- 再是配置文件 **`default`** 指向的 provider；
+- 最后才是**环境变量三件套**——且只在完全没有文件时使用，行为与 M3 完全一致。
+
+`--model` 与 `--provider` 刻意解耦：`--provider bllm --model glm-5.3-flash` 是"用 bllm
+的端点 + 密钥，但换一个模型"，两者不必成对出现。
+
+加载和校验也在这里：文件缺失返回 `null`（回退环境变量），JSON 非法、字段错误、
+`default` 指向不存在的 provider、重复的 name——全部给出**点名文件、说清问题**的
+清晰报错，而不是崩溃或半初始化。
+
+## 6.4 会话内切换：`session.send` 多一个参数
+
+M4 之前，`createSession({ config })` 启动时就钉死了模型。要让 REPL 中途换模型，
+协议层其实完全不用动——`chat(config, messages, tools, signal)` 每轮本来就接收一份
+完整的 config。要改的只是**让 config 每轮可以不同**：
+
+```ts
+async send(input, signal, override) {
+  signal?.throwIfAborted();
+  // 整个工具循环锁定一份 config，不受调用方后续修改影响
+  const config = { ...(override ?? currentConfig) };
+  currentConfig = config;
+  // ... 每轮 chatFn(config, messages, definitions, signal)
+}
+```
+
+消息历史与 provider 无关，所以切换 provider/模型可以安全沿用同一段对话。
+这是 M4 最小改动量的关键：**协议层早就把"用什么模型"和"说什么话"解耦了**，
+M4 只补上"config 从哪来、怎么切换"这一层。
+
+## 6.5 REPL 命令与交互式模型选择器
+
+REPL 现在在把输入发给模型**之前**先拦下 `/` 开头的行：
+
+```text
+/providers        列出所有 provider（* 标记当前，default 标注默认）
+/provider <name>  切换到该 provider，下一轮生效，历史保留
+/model <model>    切换到该模型，下一轮生效，历史保留
+/model            交互式：选 provider → 拉取该端点的模型列表 → 编号选择
+/help             帮助
+```
+
+裸 `/model` 最有意思——它不止会打字，还会**主动去问 API**。流程是：选一个 provider，
+`GET {baseUrl}/models` 拉回该端点公告的模型列表，过滤掉 `:batch` 这类噪音，排序、
+去重，然后列一个编号列表供选择。拉取失败或端点不公告模型（比如 bllm）时，退回
+"手输精确 id"这条永远能走的逃生通道。
+
+拉列表的代码独立成一个 `src/models.ts`，只有几十行：
+
+```ts
+export async function listModelIds(config: ModelConfig, signal?: AbortSignal): Promise<string[]> {
+  // GET {baseUrl}/models，带 Authorization；20s 超时，跟随调用方 signal
+  const ids = (data.data ?? [])
+    .map((m) => m.id)
+    .filter((id): id is string => typeof id === "string" && id.length > 0 && !HIDDEN.some((h) => id.includes(h)));
+  return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+}
+```
+
+一个之前没预料到的细节：OpenRouter 一次公告几百个模型，列表必须**封顶**（展示截断
+到 40 个），同时保留"输入精确 id 选择任意一个"的兜底，否则交互体验没法用。
+
+## 6.6 审查实录：又是四个 bug
+
+照例让第二个 agent（Codex）独立审查，这次抓出四个可复现的问题，其中两个是
+"交互式 + 多 provider"才有的新 bug 类别：
+
+1. **[P1] 中断 shell 后子进程还在跑**。`run_shell` 的中断只杀外层 shell，
+   没清理进程树——实测工具已返回中断错误，子进程却还在随后写文件。修复：
+   `spawn` 用 `detached: true` 让 shell 成为独立进程组组长，取消时对整个进程组
+   `kill(-pid, SIGKILL)`。用 SIGKILL 而非 SIGTERM，因为子进程可以忽略 SIGTERM；
+   测试专门造了一个 `process.on("SIGTERM", () => {})` 的孩子来验证它真的被杀了。
+2. **[P2] 模型选择器混用不同 provider 的端点**。以 `--provider alpha` 启动，再通过
+   裸 `/model` 选 beta 的模型：列表是从 beta 拉来的，选中的模型却发给了 alpha。
+   修复：CLI pin 了 provider 时，`/model` 只在该 provider 范围内发现并选择。
+3. **[P2] 失败回合丢掉已完成的操作记录**。工具写文件成功、下一次模型请求失败，
+   代码删除整段历史，但文件修改还在——随后输入"继续"，模型只收到这两个字，
+   不知道之前做过什么，可能重复执行。修复：工具已执行过就保留历史，给没跑完的
+   call 补结果（中断的标"可能已部分执行"，没跑的标"未执行"），并追加一句
+   "turn stopped" 说明副作用没有回滚。
+4. **[P2] `--version` 被当成 prompt 的一部分误解析**。`mo explain --version` 本应把
+   `explain --version` 整体当 prompt，实际却打印版本退出。修复：版本选项统一交给
+   `parseArgs`，首个非选项参数之后全部属于 prompt。
+
+第 1 和第 3 条尤其值得记住：**工具的副作用无法回滚**。中断可以停掉进程、可以保留
+历史，但已经写进文件系统的字节是回不去的——所以正确姿势不是假装没发生，而是
+**如实记录"发生了什么、可能发生了什么"，让模型（和人）知道现状**。
+
+## 6.7 真实 API 验证与收尾
+
+测试桩化到 74 个全绿之后，还是那句老话：用真实 API 各跑一遍。
+
+`providers.json` 落地了四个 provider（openai / claude-via-openrouter / deepseek /
+bllm），前三个真实调用全部通过；bllm 网关从本机全路径 403（服务端 WAF 白名单变化，
+非客户端可修）。交互式选择器在 OpenRouter 上实测拉到 361 个模型、编号选择正常。
+
+至此 Mo 有了第四根支柱：**想用哪个模型、就能在对话里换成哪个模型**——而这份能力
+是零依赖、几十行配置解析换来的。
+
+---
+
 # 附录 A：完整代码
 
 以下是里程碑 2 完成时的全部源码（约 700 行），作为教学基线；里程碑 3 新增的
-`session.ts`、`ask_user`、重试逻辑等以节选形式出现在第 5 章。完整、最新的仓库在
+`session.ts`、`ask_user`、重试逻辑等以节选形式出现在第 5 章，里程碑 4 新增的
+`config.ts`、`models.ts`、多 provider 解析以节选形式出现在第 6 章。完整、最新的仓库在
 `github.com/abupeiyong/mo`。
 
 ## A.1 `src/model.ts`
@@ -1567,23 +1752,39 @@ Milestone 2：
 - [ ] npm test 覆盖以上全部场景
 - [ ] 自修改验收：`npm run dev -- --version` 输出 0.1.0，diff 最小
 
+Milestone 3：
+
+- [ ] 无参数启动进入 REPL；单次 Ctrl+C 中断当前回合、两次退出
+- [ ] ask_user 只在交互会话注册；批处理模式返回提示文本而非崩溃
+- [ ] chat 超时中止、4xx 不重试、瞬态错误指数退避重试且工具不重复执行
+- [ ] 中断的回合不残留半截历史；真实 SIGINT 杀掉正在跑的 shell
+
+Milestone 4：
+
+- [ ] providers.json 缺失/非法/字段错误给出点名文件的清晰报错
+- [ ] resolveConfig 优先级：CLI flags > REPL 切换 > default > 环境变量
+- [ ] --provider / --model 可组合；REPL /providers /provider /model 下一轮生效且历史连续
+- [ ] 裸 /model 拉取端点模型列表、封顶展示、精确 id 兜底；CLI pin 的 provider 不混用端点
+- [ ] 中断 shell 杀掉整个进程树；失败回合保留已完成工具记录并标记未执行调用
+
 ---
 
 # 后记：下一步
 
-三个里程碑走下来，Mo 已经：能搜索、读取、精确编辑自己的代码（M2），
-能对话、会提问、不会挂死（M3）。每一步之后都停下来真实使用，
-再根据手感决定下一步。目前排在前面的候选：
+四个里程碑走下来，Mo 已经：能搜索、读取、精确编辑自己的代码（M2），
+能对话、会提问、不会挂死（M3），能在对话里随时换模型、换端点而不丢历史（M4）。
+每一步之后都停下来真实使用，再根据手感决定下一步。目前排在前面的候选：
 
 - **跨运行记忆（`--continue`）**：会话有了，但进程一退出历史就没了。
-  会话持久化是自然的下一个台阶（M3 spec 明确留给 M4）。
+  会话持久化是自然的下一个台阶。
 - **权限系统**：`ask_user` 是种子——让模型在破坏性操作前询问，
   逐步取代"诚实的非沙箱"声明。
 - **真正的 TUI**：会话模块已经就位，它是 TUI 的地基。
-- **加固类小项**：`read_file` 大小上限、`.env` 解析器、`--help`。
-- MCP、多 agent 协作、上下文压缩：等真实使用暴露出问题再说。
+- **最小上下文管理**：长会话会顶到上下文窗口，需要某种压缩或裁剪。
+- **加固类小项**：`read_file` 大小上限、`.env` 解析器、git 工具。
+- MCP、多 agent 协作：等真实使用暴露出问题再说。
 
 每一件都值得做，但每一件都要在"最小可用"之后才做。
-三步诞生记仍在继续。
+四步诞生记仍在继续。
 
 *—— 感谢 Claude Code 与 Codex 作为开发与审查伙伴，也感谢 Mo 自己改掉了自己写下的 bug。*

@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>附录 A：完整代码 · 从零搭建你自己的 Code Agent</title>
-<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<title>第 6 章 Milestone 4：模型选择与多 provider 配置 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的四步诞生记"/>
 <link rel="stylesheet" href="../style.css"/>
 </head>
 <body>
@@ -15,601 +15,93 @@
 <div class="wrap">
 
 <article>
-<h1>附录 A：完整代码</h1>
-<p>以下是里程碑 2 完成时的全部源码（约 700 行），作为教学基线；里程碑 3 新增的 <code>session.ts</code>、<code>ask_user</code>、重试逻辑等以节选形式出现在第 5 章。完整、最新的仓库在 <code>github.com/abupeiyong/mo</code>。</p>
-<h2>A.1 <code>src/model.ts</code></h2>
-<pre><code>// Thin client for an OpenAI-compatible "chat completions" API, using native fetch.
-// This is the only place that knows about HTTP or the wire format.
-
-export type ModelConfig = {
-  apiKey: string;
-  baseUrl: string; // e.g. https://api.example.com/v1
-  model: string;
-};
-
-/** A tool as advertised to the model (OpenAI "function" tool format). */
-export type ToolDefinition = {
-  type: "function";
-  function: {
-    name: string;
-    description: string;
-    parameters: Record&lt;string, unknown&gt;; // JSON Schema for the arguments
-  };
-};
-
-/** A tool invocation requested by the model. Arguments arrive as a JSON string. */
-export type ToolCall = {
-  id: string;
-  type: "function";
-  function: {
-    name: string;
-    arguments: string;
-  };
-};
-
-export type AssistantMessage = {
-  role: "assistant";
-  content: string | null;
-  tool_calls?: ToolCall[];
-};
-
-export type Message =
-  | { role: "system"; content: string }
-  | { role: "user"; content: string }
-  | AssistantMessage
-  | { role: "tool"; tool_call_id: string; content: string };
-
-type ChatCompletionResponse = {
-  choices: { message: AssistantMessage }[];
-};
-
-/** Read MO_API_KEY, MO_BASE_URL and MO_MODEL from the environment. */
-export function configFromEnv(): ModelConfig {
-  return {
-    apiKey: requireEnv("MO_API_KEY"),
-    baseUrl: requireEnv("MO_BASE_URL").replace(/\/+$/, ""),
-    model: requireEnv("MO_MODEL"),
-  };
-}
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable ${name}`);
-  }
-  return value;
-}
-
-/** Send the conversation to the model and return its next message. */
-export async function chat(
-  config: ModelConfig,
-  messages: Message[],
-  tools: ToolDefinition[],
-): Promise&lt;AssistantMessage&gt; {
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify({ model: config.model, messages, tools }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Model API error ${response.status}: ${await response.text()}`);
-  }
-
-  const data = (await response.json()) as ChatCompletionResponse;
-  const message = data.choices[0]?.message;
-  if (!message) {
-    throw new Error("Model API returned no choices");
-  }
-
-  // Keep only the fields we understand so the history stays clean when sent back.
-  return { role: "assistant", content: message.content ?? null, tool_calls: message.tool_calls };
+<h1>第 6 章 Milestone 4：模型选择与多 provider 配置</h1>
+<h2>6.1 优先级变化：为什么是模型选择</h2>
+<p>M3 收尾时，spec 给 M4 排的候选是<strong>跨运行记忆</strong>——会话有了，进程一退出历史就没了， 持久化看起来是自然的下一个台阶。但真实用了几天之后，一个更基础的痛点先冒了出来：</p>
+<p>切换模型要改环境变量、重启、重新描述任务。</p>
+<pre><code>$ MO_MODEL=deepseek-chat MO_BASE_URL=... mo "帮我看看这个 bug"</code></pre>
+<p>想换个模型？得改 <code>.env</code> / <code>export</code>，或者干脆退出重来、丢掉整段对话。</p>
+<p>手里其实有好几个可用的端点——OpenAI、DeepSeek、公司内部的 bllm 网关——但 Mo 只认 一套环境变量三件套，等价于"只有一个 provider"。想换个更强的模型继续同一段对话， 只能退出重来。这不是新能力，而是<strong>让已有能力可切换</strong>，优先级更高。</p>
+<p>于是 M4 的目标收敛成一句话：<strong>配置化多个 provider + 会话内/命令行切换模型</strong>， 同时保持零依赖和向后兼容——没有配置文件时，行为与 M3 逐字节一致。</p>
+<h2>6.2 一个架构决策：单协议</h2>
+<p>动工前先定下一个会影响后续所有工作的决策：<strong>Mo 只认 OpenAI-compatible 的 <code>/chat/completions</code>，不实现原生 Anthropic Messages API，也不预留任何 <code>protocol</code> 字段。</strong></p>
+<p>理由一句话：OpenAI-compatible 已经是 LLM 的通用语——OpenAI、DeepSeek、GLM、Qwen、 OpenRouter、内部网关全都提供；想用 Claude，配一个 OpenAI 兼容的端点就行。</p>
+<p>这条不是拍脑袋，是实测出来的。M4 动工前用 <code>anthropic/claude-sonnet-5</code>（经 OpenRouter 的 OpenAI 兼容端点）跑了一遍完整工具调用协议：tools schema → <code>tool_calls</code> → OpenAI 格式的工具结果回填，全部正常。既然第二协议带来的只是一层翻译器，而收益为零， 那就干脆不写。</p>
+<p>这个决策还落到了代码里——<code>config.ts</code> 的校验器<strong>显式拒绝</strong> <code>protocol</code> 字段：</p>
+<pre><code>if ("protocol" in entry) throw invalid(path, `${where}: "protocol" is not supported; use an OpenAI-compatible endpoint`);</code></pre>
+<p>不是"忽略未知字段"，而是"明确报错"。将来某天真要直连纯 Anthropic 端点，报错信息 会告诉你这是刻意不做，而不是漏做。</p>
+<h2>6.3 providers.json 与 resolveConfig：配置从哪来</h2>
+<p>新增 <code>src/config.ts</code>，只承担一件事：<strong>把"我想用谁"解析成一份完整的 <code>ModelConfig</code></strong>。</p>
+<p>配置文件默认在 <code>~/.config/mo/providers.json</code>（<code>MO_CONFIG</code> 可覆盖路径），形如：</p>
+<pre><code>{
+  "default": "openai",
+  "providers": [
+    { "name": "openai",   "apiKey": "sk-...", "baseUrl": "https://api.openai.com/v1",        "model": "gpt-4o-mini" },
+    { "name": "deepseek", "apiKey": "sk-...", "baseUrl": "https://api.deepseek.com",          "model": "deepseek-chat" },
+    { "name": "bllm",     "apiKey": "sk-...", "baseUrl": "https://bllm.discover.botim.io/v1", "model": "glm-5.3-flash" }
+  ]
 }</code></pre>
-<h2>A.2 <code>src/agent.ts</code></h2>
-<pre><code>// The agent loop: prompt -&gt; model -&gt; (tool calls -&gt; results -&gt; model)* -&gt; final text.
-
-import { chat, type Message, type ModelConfig } from "./model.js";
-import { executeTool, toolDefinitions } from "./tools/index.js";
-
-const SYSTEM_PROMPT = `You are Mo, a minimal AI coding assistant running in the user's terminal.
-You can search, read, edit and write files and run shell commands in the current working directory using the provided tools.
-Use tools to look at real files and outputs instead of guessing. When the task is done, reply with a concise final answer.
-When changing code:
-- Use search_files and read_file to look at the real code before editing.
-- Prefer edit_file when changing existing files.
-- Use write_file only to create new files or for a deliberate full-file replacement.
-- After making changes, run the project's existing typecheck, test and build commands.`;
-
-/** Safety cap so a confused model cannot loop (and bill) forever. */
-const MAX_TURNS = 50;
-
-export async function runAgent(config: ModelConfig, prompt: string): Promise&lt;string&gt; {
-  const messages: Message[] = [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: prompt },
-  ];
-
-  for (let turn = 0; turn &lt; MAX_TURNS; turn++) {
-    const reply = await chat(config, messages, toolDefinitions);
-    messages.push(reply);
-
-    // No tool calls -&gt; this is the final answer.
-    if (!reply.tool_calls || reply.tool_calls.length === 0) {
-      if (reply.content === null) {
-        throw new Error("Model returned neither tool calls nor a final text response");
-      }
-      return reply.content;
-    }
-
-    // Execute every requested tool and append each result as a "tool" message,
-    // then go around the loop so the model can see the results.
-    for (const call of reply.tool_calls) {
-      console.error(`[tool] ${call.function.name} ${call.function.arguments}`);
-      const result = await executeTool(call.function.name, call.function.arguments);
-      messages.push({ role: "tool", tool_call_id: call.id, content: result });
-    }
+<p>优先级从高到低，<code>resolveConfig</code> 里一眼就能读完：</p>
+<pre><code>export function resolveConfig(flags: Flags = {}, file: ProvidersFile | null = loadProviders(), session: Flags = {}): ResolvedConfig {
+  const name = flags.provider ?? session.provider ?? file?.default;
+  const model = flags.model ?? session.model;
+  if (file === null) {
+    if (name !== undefined) throw new Error(`No providers file at ${configPath()} (--provider needs one)`);
+    const config = configFromEnv();   // 无文件：回到 M3 的环境变量三件套
+    return { config: model === undefined ? config : { ...config, model } };
   }
-
-  throw new Error(`Agent stopped after ${MAX_TURNS} turns without a final answer`);
+  if (name === undefined) throw new Error("No default provider in providers file; choose one with --provider &lt;name&gt; or set default");
+  const provider = findProvider(file, name);
+  return { provider: provider.name, config: configFromProvider(provider, model) };
 }</code></pre>
-<h2>A.3 <code>src/index.ts</code></h2>
-<pre><code>#!/usr/bin/env node
-// Mo CLI entry point. Run directly: `mo "&lt;prompt&gt;"` (global install),
-// or from source: `npm run dev -- "&lt;prompt&gt;"`.
-
-import { readFileSync, existsSync } from "node:fs";
-import { runAgent } from "./agent.js";
-import { configFromEnv } from "./model.js";
-
-// When run as a globally installed binary there is no --env-file flag, so
-// load a .env from the current directory if one exists. Never overrides
-// variables that are already set in the environment.
-const envPath = ".env";
-if (existsSync(envPath)) {
-  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) continue;
-    const eq = trimmed.indexOf("=");
-    const key = trimmed.slice(0, eq).trim();
-    const value = trimmed.slice(eq + 1).trim();
-    if (process.env[key] === undefined) process.env[key] = value;
-  }
-}
-
-const args = process.argv.slice(2);
-
-if (args.includes('--version')) {
-  console.log(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
-  process.exit(0);
-}
-
-const prompt = args.join(" ").trim();
-if (!prompt) {
-  console.error('Usage: mo "&lt;prompt&gt;"');
-  process.exit(1);
-}
-
-try {
-  const answer = await runAgent(configFromEnv(), prompt);
-  console.log(answer);
-} catch (error) {
-  console.error(`mo: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
+<ul><li><strong>CLI flags</strong>（<code>--provider</code> / <code>--model</code>）最高；</li><li>然后是 <strong>REPL 会话内切换</strong>（<code>session</code> 参数）；</li><li>再是配置文件 <strong><code>default</code></strong> 指向的 provider；</li><li>最后才是<strong>环境变量三件套</strong>——且只在完全没有文件时使用，行为与 M3 完全一致。</li></ul>
+<p><code>--model</code> 与 <code>--provider</code> 刻意解耦：<code>--provider bllm --model glm-5.3-flash</code> 是"用 bllm 的端点 + 密钥，但换一个模型"，两者不必成对出现。</p>
+<p>加载和校验也在这里：文件缺失返回 <code>null</code>（回退环境变量），JSON 非法、字段错误、 <code>default</code> 指向不存在的 provider、重复的 name——全部给出<strong>点名文件、说清问题</strong>的 清晰报错，而不是崩溃或半初始化。</p>
+<h2>6.4 会话内切换：<code>session.send</code> 多一个参数</h2>
+<p>M4 之前，<code>createSession({ config })</code> 启动时就钉死了模型。要让 REPL 中途换模型， 协议层其实完全不用动——<code>chat(config, messages, tools, signal)</code> 每轮本来就接收一份 完整的 config。要改的只是<strong>让 config 每轮可以不同</strong>：</p>
+<pre><code>async send(input, signal, override) {
+  signal?.throwIfAborted();
+  // 整个工具循环锁定一份 config，不受调用方后续修改影响
+  const config = { ...(override ?? currentConfig) };
+  currentConfig = config;
+  // ... 每轮 chatFn(config, messages, definitions, signal)
 }</code></pre>
-<h2>A.4 <code>src/tools/index.ts</code></h2>
-<pre><code>// Tool registry and dispatcher. The agent loop only ever talks to this file.
-
-import type { ToolDefinition } from "../model.js";
-import { readFileTool } from "./read-file.js";
-import { runShellTool } from "./run-shell.js";
-import { writeFileTool } from "./write-file.js";
-import { editFileTool } from "./edit-file.js";
-import { searchFilesTool } from "./search-files.js";
-
-/** A tool = what the model sees (definition) + what runs locally (execute). */
-export type Tool = {
-  definition: ToolDefinition;
-  execute: (args: Record&lt;string, unknown&gt;) =&gt; Promise&lt;string&gt;;
-};
-
-const tools: Tool[] = [readFileTool, writeFileTool, runShellTool, editFileTool, searchFilesTool];
-
-/** Definitions in the shape the chat completions API expects. */
-export const toolDefinitions: ToolDefinition[] = tools.map((tool) =&gt; tool.definition);
-
-/**
- * Run a tool by name with its JSON-encoded arguments.
- * Failures are returned as text (not thrown) so the model can read and react to them.
- */
-export async function executeTool(name: string, rawArgs: string): Promise&lt;string&gt; {
-  const tool = tools.find((t) =&gt; t.definition.function.name === name);
-  if (!tool) {
-    return `Error: unknown tool "${name}"`;
-  }
-
-  try {
-    const args = (rawArgs.trim() === "" ? {} : JSON.parse(rawArgs)) as Record&lt;string, unknown&gt;;
-    return await tool.execute(args);
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
-  }
+<p>消息历史与 provider 无关，所以切换 provider/模型可以安全沿用同一段对话。 这是 M4 最小改动量的关键：<strong>协议层早就把"用什么模型"和"说什么话"解耦了</strong>， M4 只补上"config 从哪来、怎么切换"这一层。</p>
+<h2>6.5 REPL 命令与交互式模型选择器</h2>
+<p>REPL 现在在把输入发给模型<strong>之前</strong>先拦下 <code>/</code> 开头的行：</p>
+<pre><code>/providers        列出所有 provider（* 标记当前，default 标注默认）
+/provider &lt;name&gt;  切换到该 provider，下一轮生效，历史保留
+/model &lt;model&gt;    切换到该模型，下一轮生效，历史保留
+/model            交互式：选 provider → 拉取该端点的模型列表 → 编号选择
+/help             帮助</code></pre>
+<p>裸 <code>/model</code> 最有意思——它不止会打字，还会<strong>主动去问 API</strong>。流程是：选一个 provider， <code>GET {baseUrl}/models</code> 拉回该端点公告的模型列表，过滤掉 <code>:batch</code> 这类噪音，排序、 去重，然后列一个编号列表供选择。拉取失败或端点不公告模型（比如 bllm）时，退回 "手输精确 id"这条永远能走的逃生通道。</p>
+<p>拉列表的代码独立成一个 <code>src/models.ts</code>，只有几十行：</p>
+<pre><code>export async function listModelIds(config: ModelConfig, signal?: AbortSignal): Promise&lt;string[]&gt; {
+  // GET {baseUrl}/models，带 Authorization；20s 超时，跟随调用方 signal
+  const ids = (data.data ?? [])
+    .map((m) =&gt; m.id)
+    .filter((id): id is string =&gt; typeof id === "string" &amp;&amp; id.length &gt; 0 &amp;&amp; !HIDDEN.some((h) =&gt; id.includes(h)));
+  return [...new Set(ids)].sort((a, b) =&gt; a.localeCompare(b));
 }</code></pre>
-<h2>A.5 <code>src/tools/path.ts</code></h2>
-<pre><code>// Workspace path boundary. Every file tool resolves model-supplied paths here
-// so containment logic lives in one place. This is not a sandbox: run_shell can
-// still touch anything the user can.
-
-import { lstat, realpath } from "node:fs/promises";
-import { realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
-
-/** Workspace root = the working directory when Mo started. */
-export const workspaceRoot = realpathSync(process.cwd());
-
-function isInsideWorkspace(absolutePath: string): boolean {
-  const rel = relative(workspaceRoot, absolutePath);
-  return rel === "" || (!rel.startsWith("..") &amp;&amp; !isAbsolute(rel));
-}
-
-function outsideWorkspaceError(path: string): Error {
-  return new Error(`path "${path}" is outside the workspace; paths must stay inside the working directory Mo was started in`);
-}
-
-/**
- * Resolve a path that must already exist (read_file, edit_file, search_files).
- * Symlinks are followed via realpath before the containment check, so a link
- * inside the workspace cannot point outside it.
- */
-export async function resolveExistingPath(path: string): Promise&lt;string&gt; {
-  const resolved = resolve(workspaceRoot, path);
-  if (!isInsideWorkspace(resolved)) {
-    throw outsideWorkspaceError(path);
-  }
-
-  let real: string;
-  try {
-    real = await realpath(resolved);
-  } catch {
-    throw new Error(`file not found: "${path}"`);
-  }
-  if (!isInsideWorkspace(real)) {
-    throw outsideWorkspaceError(path);
-  }
-  return real;
-}
-
-/**
- * Resolve a path that may not exist yet (write_file). The nearest existing
- * ancestor (or the target itself, if it exists) is realpath'd before the
- * containment check, so a symlinked directory cannot escape the workspace.
- */
-export async function resolveWritePath(path: string): Promise&lt;string&gt; {
-  const resolved = resolve(workspaceRoot, path);
-  if (!isInsideWorkspace(resolved)) {
-    throw outsideWorkspaceError(path);
-  }
-
-  let existing = resolved;
-  while (true) {
-    try {
-      await lstat(existing);
-    } catch {
-      // Does not exist yet; try the parent next.
-      const parent = dirname(existing);
-      if (parent === existing) {
-        throw outsideWorkspaceError(path);
-      }
-      existing = parent;
-      continue;
-    }
-
-    let real: string;
-    try {
-      real = await realpath(existing);
-    } catch {
-      // An entry exists but cannot be resolved (for example, a dangling
-      // symlink). Treat it as unsafe instead of falling back to its parent:
-      // writeFile would follow that symlink and could create a file outside.
-      throw outsideWorkspaceError(path);
-    }
-    if (!isInsideWorkspace(real)) {
-      throw outsideWorkspaceError(path);
-    }
-    return resolved;
-  }
-}</code></pre>
-<h2>A.6 <code>src/tools/read-file.ts</code></h2>
-<pre><code>import { readFile } from "node:fs/promises";
-import type { Tool } from "./index.js";
-import { resolveExistingPath } from "./path.js";
-
-export const readFileTool: Tool = {
-  definition: {
-    type: "function",
-    function: {
-      name: "read_file",
-      description: "Read a UTF-8 text file and return its full contents.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description: "File path relative to the workspace root. Must stay inside the workspace.",
-          },
-        },
-        required: ["path"],
-      },
-    },
-  },
-
-  async execute(args) {
-    const path = args.path;
-    if (typeof path !== "string") {
-      throw new Error("read_file: 'path' must be a string");
-    }
-    return readFile(await resolveExistingPath(path), "utf8");
-  },
-};</code></pre>
-<h2>A.7 <code>src/tools/write-file.ts</code></h2>
-<pre><code>import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
-import type { Tool } from "./index.js";
-import { resolveWritePath } from "./path.js";
-
-export const writeFileTool: Tool = {
-  definition: {
-    type: "function",
-    function: {
-      name: "write_file",
-      description:
-        "Write text to a file, replacing any existing content. Creates the file and parent directories if needed.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description: "File path relative to the workspace root. Must stay inside the workspace.",
-          },
-          content: {
-            type: "string",
-            description: "The full text content to write.",
-          },
-        },
-        required: ["path", "content"],
-      },
-    },
-  },
-
-  async execute(args) {
-    const { path, content } = args;
-    if (typeof path !== "string" || typeof content !== "string") {
-      throw new Error("write_file: 'path' and 'content' must be strings");
-    }
-    const resolved = await resolveWritePath(path);
-    await mkdir(dirname(resolved), { recursive: true });
-    await writeFile(resolved, content, "utf8");
-    return `Wrote ${content.length} characters to ${path}`;
-  },
-};</code></pre>
-<h2>A.8 <code>src/tools/run-shell.ts</code></h2>
-<pre><code>import { exec } from "node:child_process";
-import type { Tool } from "./index.js";
-
-const TIMEOUT_MS = 60_000;
-const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
-
-export const runShellTool: Tool = {
-  definition: {
-    type: "function",
-    function: {
-      name: "run_shell",
-      description:
-        "Run a shell command in the current working directory and return its exit code, stdout and stderr. " +
-        `Commands are killed after ${TIMEOUT_MS / 1000} seconds.`,
-      parameters: {
-        type: "object",
-        properties: {
-          command: {
-            type: "string",
-            description: "The shell command to run, e.g. `ls -la` or `npm test`.",
-          },
-        },
-        required: ["command"],
-      },
-    },
-  },
-
-  execute(args) {
-    const command = args.command;
-    if (typeof command !== "string") {
-      throw new Error("run_shell: 'command' must be a string");
-    }
-
-    return new Promise((resolve) =&gt; {
-      exec(command, { timeout: TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) =&gt; {
-        // A non-zero exit is reported to the model as text, not thrown as an error.
-        const exitCode = error ? (error.code ?? "unknown") : 0;
-        const timedOut = error?.killed ? ` (killed after ${TIMEOUT_MS / 1000}s timeout)` : "";
-        resolve(`exit code: ${exitCode}${timedOut}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
-      });
-    });
-  },
-};</code></pre>
-<h2>A.9 <code>src/tools/edit-file.ts</code></h2>
-<pre><code>import { readFile, writeFile } from "node:fs/promises";
-import type { Tool } from "./index.js";
-import { resolveExistingPath } from "./path.js";
-
-export const editFileTool: Tool = {
-  definition: {
-    type: "function",
-    function: {
-      name: "edit_file",
-      description:
-        "Replace one exact occurrence of old_text with new_text in an existing file inside the workspace. " +
-        "Fails without touching the file if old_text is not found or appears more than once.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description: "Path to an existing file, relative to the workspace root.",
-          },
-          old_text: {
-            type: "string",
-            description: "Exact existing text to replace; must appear exactly once in the file.",
-          },
-          new_text: {
-            type: "string",
-            description: "The replacement text.",
-          },
-        },
-        required: ["path", "old_text", "new_text"],
-      },
-    },
-  },
-
-  async execute(args) {
-    const { path, old_text: oldText, new_text: newText } = args;
-    if (typeof path !== "string" || typeof oldText !== "string" || typeof newText !== "string") {
-      throw new Error("edit_file: 'path', 'old_text' and 'new_text' must be strings");
-    }
-    if (oldText === "") {
-      throw new Error("edit_file: 'old_text' must not be empty");
-    }
-
-    const resolved = await resolveExistingPath(path);
-    const content = await readFile(resolved, "utf8");
-
-    const first = content.indexOf(oldText);
-    if (first === -1) {
-      throw new Error(`edit_file: old_text was not found in ${path}; read the file and pass the exact existing text`);
-    }
-    if (content.indexOf(oldText, first + 1) !== -1) {
-      throw new Error(
-        `edit_file: old_text appears more than once in ${path}; include more surrounding context so it matches exactly once`,
-      );
-    }
-
-    const updated = content.slice(0, first) + newText + content.slice(first + oldText.length);
-    await writeFile(resolved, updated, "utf8");
-    return `Edited ${path}: replaced ${oldText.length} characters with ${newText.length} characters`;
-  },
-};</code></pre>
-<h2>A.10 <code>src/tools/search-files.ts</code></h2>
-<pre><code>import { readFile, readdir, stat } from "node:fs/promises";
-import { join, relative } from "node:path";
-import type { Tool } from "./index.js";
-import { resolveExistingPath, workspaceRoot } from "./path.js";
-
-const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "dist"]);
-const MAX_MATCHES = 200;
-
-export const searchFilesTool: Tool = {
-  definition: {
-    type: "function",
-    function: {
-      name: "search_files",
-      description:
-        "Search UTF-8 text files recursively for a literal string (no regex). " +
-        `Returns matches as path:line:content, at most ${MAX_MATCHES}. Skips .git, node_modules and dist.`,
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Literal text to search for. Not a regex.",
-          },
-          path: {
-            type: "string",
-            description:
-              "Directory (or file) to search, relative to the workspace root. Defaults to the workspace root.",
-          },
-        },
-        required: ["query"],
-      },
-    },
-  },
-
-  async execute(args) {
-    const { query, path } = args;
-    if (typeof query !== "string" || query === "") {
-      throw new Error("search_files: 'query' must be a non-empty string");
-    }
-    if (path !== undefined &amp;&amp; typeof path !== "string") {
-      throw new Error("search_files: 'path' must be a string");
-    }
-
-    const root = await resolveExistingPath(path ?? ".");
-    const matches: string[] = [];
-    let truncated = false;
-
-    const searchFile = async (filePath: string): Promise&lt;void&gt; =&gt; {
-      let content: string;
-      try {
-        content = await readFile(filePath, "utf8");
-      } catch {
-        return; // unreadable file; skip
-      }
-      if (content.includes("\u0000")) {
-        return; // binary file; skip
-      }
-      const lines = content.split("\n");
-      for (let i = 0; i &lt; lines.length; i++) {
-        const line = lines[i].replace(/\r$/, "");
-        if (!line.includes(query)) {
-          continue;
-        }
-        if (matches.length &gt;= MAX_MATCHES) {
-          truncated = true;
-          return;
-        }
-        matches.push(`${relative(workspaceRoot, filePath)}:${i + 1}:${line}`);
-      }
-    };
-
-    const walk = async (dir: string): Promise&lt;void&gt; =&gt; {
-      const entries = await readdir(dir, { withFileTypes: true });
-      entries.sort((a, b) =&gt; a.name.localeCompare(b.name));
-      for (const entry of entries) {
-        if (truncated) {
-          return;
-        }
-        const entryPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!SKIPPED_DIRECTORIES.has(entry.name)) {
-            await walk(entryPath);
-          }
-        } else if (entry.isFile()) {
-          await searchFile(entryPath); // symlinks are neither, so they are skipped
-        }
-      }
-    };
-
-    if ((await stat(root)).isDirectory()) {
-      await walk(root);
-    } else {
-      await searchFile(root);
-    }
-
-    if (matches.length === 0) {
-      return `No matches found for "${query}"`;
-    }
-    const output = matches.join("\n");
-    return truncated ? `${output}\n(truncated: showing the first ${MAX_MATCHES} matches)` : output;
-  },
-};</code></pre>
-<h2>A.11 <code>test/tools.test.ts</code>（测试要点）</h2>
-<p>测试使用 Node 内置 <code>node:test</code>，通过 <code>tsx</code> 执行。要点：</p>
-<ul><li>直接调用 <code>executeTool</code>（工具名 + JSON 字符串参数），同时覆盖了注册表和</li></ul>
-<p>  "失败返回文本"契约</p>
-<ul><li>fixture 放在工作区内的 <code>tmp/tools-test-fixtures/</code>，测试结束在 <code>after()</code> 中清理</li><li>一个 mkdtemp 目录放在工作区外，用于构造符号链接逃逸场景</li><li>对"零匹配 / 多匹配不写文件"的断言同时检查内容<strong>和 mtime</strong> 未变</li></ul>
+<p>一个之前没预料到的细节：OpenRouter 一次公告几百个模型，列表必须<strong>封顶</strong>（展示截断 到 40 个），同时保留"输入精确 id 选择任意一个"的兜底，否则交互体验没法用。</p>
+<h2>6.6 审查实录：又是四个 bug</h2>
+<p>照例让第二个 agent（Codex）独立审查，这次抓出四个可复现的问题，其中两个是 "交互式 + 多 provider"才有的新 bug 类别：</p>
+<ol><li><strong>[P1] 中断 shell 后子进程还在跑</strong>。<code>run_shell</code> 的中断只杀外层 shell，</li></ol>
+<p>   没清理进程树——实测工具已返回中断错误，子进程却还在随后写文件。修复：    <code>spawn</code> 用 <code>detached: true</code> 让 shell 成为独立进程组组长，取消时对整个进程组    <code>kill(-pid, SIGKILL)</code>。用 SIGKILL 而非 SIGTERM，因为子进程可以忽略 SIGTERM；    测试专门造了一个 <code>process.on("SIGTERM", () =&gt; {})</code> 的孩子来验证它真的被杀了。</p>
+<ol><li><strong>[P2] 模型选择器混用不同 provider 的端点</strong>。以 <code>--provider alpha</code> 启动，再通过</li></ol>
+<p>   裸 <code>/model</code> 选 beta 的模型：列表是从 beta 拉来的，选中的模型却发给了 alpha。    修复：CLI pin 了 provider 时，<code>/model</code> 只在该 provider 范围内发现并选择。</p>
+<ol><li><strong>[P2] 失败回合丢掉已完成的操作记录</strong>。工具写文件成功、下一次模型请求失败，</li></ol>
+<p>   代码删除整段历史，但文件修改还在——随后输入"继续"，模型只收到这两个字，    不知道之前做过什么，可能重复执行。修复：工具已执行过就保留历史，给没跑完的    call 补结果（中断的标"可能已部分执行"，没跑的标"未执行"），并追加一句    "turn stopped" 说明副作用没有回滚。</p>
+<ol><li><strong>[P2] <code>--version</code> 被当成 prompt 的一部分误解析</strong>。<code>mo explain --version</code> 本应把</li></ol>
+<p>   <code>explain --version</code> 整体当 prompt，实际却打印版本退出。修复：版本选项统一交给    <code>parseArgs</code>，首个非选项参数之后全部属于 prompt。</p>
+<p>第 1 和第 3 条尤其值得记住：<strong>工具的副作用无法回滚</strong>。中断可以停掉进程、可以保留 历史，但已经写进文件系统的字节是回不去的——所以正确姿势不是假装没发生，而是 <strong>如实记录"发生了什么、可能发生了什么"，让模型（和人）知道现状</strong>。</p>
+<h2>6.7 真实 API 验证与收尾</h2>
+<p>测试桩化到 74 个全绿之后，还是那句老话：用真实 API 各跑一遍。</p>
+<p><code>providers.json</code> 落地了四个 provider（openai / claude-via-openrouter / deepseek / bllm），前三个真实调用全部通过；bllm 网关从本机全路径 403（服务端 WAF 白名单变化， 非客户端可修）。交互式选择器在 OpenRouter 上实测拉到 361 个模型、编号选择正常。</p>
+<p>至此 Mo 有了第四根支柱：<strong>想用哪个模型、就能在对话里换成哪个模型</strong>——而这份能力 是零依赖、几十行配置解析换来的。</p>
 <hr/>
 </article>
-<nav class="pager"><a href="ch-06.html">← 第 5 章 Milestone 3：让 agent 开口问（交互式会话）</a><span></span><a href="ch-08.html">附录 B：命令与验收清单 →</a></nav>
+<nav class="pager"><a href="ch-06.html">← 第 5 章 Milestone 3：让 agent 开口问（交互式会话）</a><span></span><a href="ch-08.html">附录 A：完整代码 →</a></nav>
 </div>
 <footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
 </body>

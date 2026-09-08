@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>后记：下一步 · 从零搭建你自己的 Code Agent</title>
-<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的三步诞生记"/>
+<title>附录 B：命令与验收清单 · 从零搭建你自己的 Code Agent</title>
+<meta name="description" content="Mo 开发实录：一个最小 AI 编程助手的四步诞生记"/>
 <link rel="stylesheet" href="../style.css"/>
 </head>
 <body>
@@ -15,17 +15,29 @@
 <div class="wrap">
 
 <article>
-<h1>后记：下一步</h1>
-<p>三个里程碑走下来，Mo 已经：能搜索、读取、精确编辑自己的代码（M2）， 能对话、会提问、不会挂死（M3）。每一步之后都停下来真实使用， 再根据手感决定下一步。目前排在前面的候选：</p>
-<ul><li><strong>跨运行记忆（<code>--continue</code>）</strong>：会话有了，但进程一退出历史就没了。</li></ul>
-<p>  会话持久化是自然的下一个台阶（M3 spec 明确留给 M4）。</p>
-<ul><li><strong>权限系统</strong>：<code>ask_user</code> 是种子——让模型在破坏性操作前询问，</li></ul>
-<p>  逐步取代"诚实的非沙箱"声明。</p>
-<ul><li><strong>真正的 TUI</strong>：会话模块已经就位，它是 TUI 的地基。</li><li><strong>加固类小项</strong>：<code>read_file</code> 大小上限、<code>.env</code> 解析器、<code>--help</code>。</li><li>MCP、多 agent 协作、上下文压缩：等真实使用暴露出问题再说。</li></ul>
-<p>每一件都值得做，但每一件都要在"最小可用"之后才做。 三步诞生记仍在继续。</p>
-<p>*—— 感谢 Claude Code 与 Codex 作为开发与审查伙伴，也感谢 Mo 自己改掉了自己写下的 bug。*</p>
+<h1>附录 B：命令与验收清单</h1>
+<h2>B.1 环境变量</h2>
+<table><thead><tr><th>变量</th><th>含义</th><th>示例</th></tr></thead><tbody><tr><td><code>MO_API_KEY</code></td><td>发送在 <code>Authorization: Bearer</code> 头的密钥</td><td><code>sk-...</code></td></tr><tr><td><code>MO_BASE_URL</code></td><td>OpenAI 兼容 API 根地址（不含尾部斜杠）</td><td><code>https://api.openai.com/v1</code></td></tr><tr><td><code>MO_MODEL</code></td><td>模型名</td><td><code>gpt-4o-mini</code></td></tr></tbody></table>
+<h2>B.2 常用命令</h2>
+<pre><code>npm install                 # 安装 devDependencies（typescript / tsx / @types/node）
+npm run dev -- "&lt;prompt&gt;"   # 从源码运行（自动加载 .env）
+npm run typecheck           # tsc --noEmit
+npm test                    # node:test 测试
+npm run build               # 编译到 dist/
+npm run start -- "&lt;prompt&gt;" # 运行编译产物
+npm link &amp;&amp; mo "&lt;prompt&gt;"   # 全局安装并运行</code></pre>
+<h2>B.3 里程碑验收清单</h2>
+<p>Milestone 1：</p>
+<ul><li>[ ] 命令行接受 prompt，调用 OpenAI 兼容 API</li><li>[ ] 三个工具（read_file / write_file / run_shell）可被模型调用并本地执行</li><li>[ ] 工具结果按 tool_call_id 回填，循环直到最终答案</li><li>[ ] typecheck / build 通过；缺失环境变量时报错清晰</li></ul>
+<p>Milestone 2：</p>
+<ul><li>[ ] search_files：字面搜索、跳过 .git/node_modules/dist、200 条上限、path:line:content</li><li>[ ] edit_file：唯一匹配才替换；零/多次匹配不写文件（内容和 mtime 不变）</li><li>[ ] 路径边界：../ 拒绝、工作区外绝对路径拒绝、符号链接逃逸拒绝、悬空符号链接拒绝</li><li>[ ] 系统提示包含四条行为约束</li><li>[ ] npm test 覆盖以上全部场景</li><li>[ ] 自修改验收：<code>npm run dev -- --version</code> 输出 0.1.0，diff 最小</li></ul>
+<p>Milestone 3：</p>
+<ul><li>[ ] 无参数启动进入 REPL；单次 Ctrl+C 中断当前回合、两次退出</li><li>[ ] ask_user 只在交互会话注册；批处理模式返回提示文本而非崩溃</li><li>[ ] chat 超时中止、4xx 不重试、瞬态错误指数退避重试且工具不重复执行</li><li>[ ] 中断的回合不残留半截历史；真实 SIGINT 杀掉正在跑的 shell</li></ul>
+<p>Milestone 4：</p>
+<ul><li>[ ] providers.json 缺失/非法/字段错误给出点名文件的清晰报错</li><li>[ ] resolveConfig 优先级：CLI flags &gt; REPL 切换 &gt; default &gt; 环境变量</li><li>[ ] --provider / --model 可组合；REPL /providers /provider /model 下一轮生效且历史连续</li><li>[ ] 裸 /model 拉取端点模型列表、封顶展示、精确 id 兜底；CLI pin 的 provider 不混用端点</li><li>[ ] 中断 shell 杀掉整个进程树；失败回合保留已完成工具记录并标记未执行调用</li></ul>
+<hr/>
 </article>
-<nav class="pager"><a href="ch-08.html">← 附录 B：命令与验收清单</a><span></span><a href="../index.html">回到目录</a></nav>
+<nav class="pager"><a href="ch-08.html">← 附录 A：完整代码</a><span></span><a href="ch-10.html">后记：下一步 →</a></nav>
 </div>
 <footer class="site">从零搭建你自己的 Code Agent · peiyong · 2026-09-03 · <a href="https://github.com/abupeiyong/mo-book">GitHub</a></footer>
 </body>

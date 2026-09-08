@@ -33,9 +33,11 @@ node build-site.mjs   # 重新生成 docs/ 在线阅读站
 3. 第 2 章 Milestone 1：跑通最小 agent loop（model / tools / agent / CLI）
 4. 第 3 章 Milestone 2：让 agent 可控地修改自己的代码（edit_file / search_files / 路径边界 / 自修改实录）
 5. 第 4 章 经验与教训（双人审查、测试盲区、安全边界诚实声明）
-6. 附录 A：完整代码 · 附录 B：命令与验收清单
+6. 第 5 章 Milestone 3：交互式会话（session / ask_user / 超时重试 / REPL）
+7. 第 6 章 Milestone 4：模型选择与多 provider（providers.json / resolveConfig / 交互式选择器）
+8. 附录 A：完整代码 · 附录 B：命令与验收清单
 
 ## 素材来源
 
-- 代码仓库：[github.com/abupeiyong/mo](https://github.com/abupeiyong/mo)（Milestone 1 + 2）
+- 代码仓库：[github.com/abupeiyong/mo](https://github.com/abupeiyong/mo)（Milestone 1–4）
 - 书稿中的代码与真实仓库保持同步；附录 A 为里程碑 2 完成时的全量源码
